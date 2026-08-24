@@ -45,7 +45,8 @@ norm gammas (see RMSNorm) and the gated-norm order (see GatedRMSNorm).
 Text-only: M-RoPE (mrope_section [11,11,10]) degenerates EXACTLY to standard
 RoPE when the time/height/width position components are all equal, which is the
 case for text tokens. Images need the real 3-way split; see note in `rope`.
-Multi-token prediction (`mtp.*`) and the vision tower are not loaded here.
+The vision tower is not loaded. Multi-token prediction IS loaded (see
+MTPDraft) and drives speculative decoding in speculative.py.
 """
 
 import glob
@@ -53,6 +54,7 @@ import json
 import math
 import os
 from dataclasses import dataclass
+from functools import partial
 from typing import List, Optional, Tuple
 
 import mlx.core as mx
@@ -84,6 +86,7 @@ class TextConfig:
     linear_key_head_dim: int = 128
     linear_value_head_dim: int = 128
     linear_conv_kernel_dim: int = 4
+    mtp_num_hidden_layers: int = 0
 
     @classmethod
     def from_json(cls, path: str) -> "TextConfig":
@@ -226,20 +229,51 @@ class KVCache:
         self.values[..., prev:self.offset, :] = values
         return self.keys[..., :self.offset, :], self.values[..., :self.offset, :]
 
+    def trim(self, length: int):
+        """Roll back to `length` tokens. Rejected speculative keys/values are left
+        in the buffer as garbage beyond `offset`; the next write overwrites them,
+        and nothing ever reads past `offset`."""
+        self.offset = length
+
 
 class DeltaCache:
-    """State for one Gated-DeltaNet layer.
+    """State for one Gated-DeltaNet layer, with rollback support.
 
-    Both fields are fixed size no matter how long the context gets -- the conv
-    ring holds kernel_size-1 timesteps and `state` is one (H, Dk, Dv) matrix per
-    head -- so there is nothing to pre-allocate and no growth to amortize. This
-    exists only to give the two layer types a uniform, mutable interface.
+    The conv ring holds kernel_size-1 timesteps and `state` is one (H, Dk, Dv)
+    matrix per head -- both fixed size no matter how long the context gets.
+
+    Rollback is the hard part of speculative decoding for a recurrent layer. A KV
+    cache rolls back by truncation, but delta-rule updates cannot be un-applied:
+    S_t = a(I - b k k^T)S_{t-1} + b k v^T destroys information about S_{t-1}.
+    So in `record` mode we do NOT advance the state. Instead we keep every
+    per-step state the forward pass already computed, and `commit(n)` just picks
+    the n-th one. Costs ~3.1 MB per step per layer (~750 MB for a 5-token block
+    across 48 layers) and zero extra compute.
     """
 
     def __init__(self):
         self.conv: Optional[mx.array] = None
         self.state: Optional[mx.array] = None
         self.offset = 0
+        self.record = False
+        self.pending = None
+        self.base_offset = 0
+
+    def commit(self, n: int):
+        """Accept the first n tokens of the recorded block and drop the rest."""
+        conv_input, S_prev, states = self.pending
+        L = len(states)
+        state = S_prev if n == 0 else states[n - 1]
+        kw = conv_input.shape[1] - L
+        conv = conv_input[:, n:n + kw]
+        # mx.contiguous DETACHES these from the graph that produced them. Without
+        # it, holding a slice keeps the whole block's computation alive -- all L
+        # states and the conv input -- and it compounds every round.
+        self.state = mx.contiguous(state)
+        self.conv = mx.contiguous(conv)
+        self.offset = self.base_offset + n
+        self.pending = None
+        self.record = False
 
 
 # ---------------------------------------------------------------------------
@@ -334,23 +368,46 @@ def chunked_delta(q, k, v, alpha, beta, S, C: int = 64):
     return Y, S
 
 
-def sequential_delta(q, k, v, alpha, beta, S):
-    """Per-token reference recurrence. Used for decode (L=1) and to test the
-    chunked form. Same signature and semantics as `chunked_delta`."""
+@partial(mx.compile, shapeless=True)
+def _delta_step(q_t, k_t, v_t, a_t, b_t, S):
+    """One gated-delta step, fused.
+
+    Unfused this is ~7 elementwise/reduce kernels on a 3.1 MB state, per layer,
+    per token -- ~340 launches per token across 48 layers, which is launch-bound
+    rather than bandwidth-bound. mx.compile fuses the chain into far fewer
+    kernels and roughly halves decode cost.
+    """
+    kS = mx.sum(k_t * S, axis=2, keepdims=True)          # k^T S
+    S = a_t * (S - b_t * (k_t * kS)) + b_t * (k_t * v_t)
+    return mx.sum(q_t * S, axis=2), S                    # S^T q, new state
+
+
+def sequential_delta(q, k, v, alpha, beta, S, collect=False):
+    """Per-token reference recurrence. Used for decode (L=1), for speculative
+    verification, and to test the chunked form.
+
+    With collect=True it also returns the per-step states [S_1..S_L]. These are
+    materialized by the loop anyway, so keeping references costs no extra compute
+    and no extra allocation -- it only keeps them alive (~3.1 MB per step per
+    layer). That turns speculative rollback into an index lookup instead of a
+    replay, which is worth it: replaying cost ~45 ms per round in kernel launches.
+    """
     B, L, H, Dk = q.shape
     if S is None:
         S = mx.zeros((B, H, Dk, v.shape[-1]), mx.float32)
-    outs = []
+    outs, states = [], []
     for t in range(L):
-        k_t = k[:, t][..., None]              # (B,H,Dk,1)
-        v_t = v[:, t][:, :, None, :]          # (B,H,1,Dv)
-        q_t = q[:, t][..., None]
-        b_t = beta[:, t][:, :, None, None]
-        a_t = alpha[:, t][:, :, None, None]
-        kS = mx.sum(k_t * S, axis=2, keepdims=True)          # k^T S
-        S = a_t * (S - b_t * (k_t * kS)) + b_t * (k_t * v_t)
-        outs.append(mx.sum(q_t * S, axis=2))                 # S^T q
-    return mx.stack(outs, axis=1), S
+        o_t, S = _delta_step(q[:, t][..., None],
+                             k[:, t][..., None],
+                             v[:, t][:, :, None, :],
+                             alpha[:, t][:, :, None, None],
+                             beta[:, t][:, :, None, None],
+                             S)
+        outs.append(o_t)
+        if collect:
+            states.append(S)
+    Y = mx.stack(outs, axis=1)
+    return (Y, S, states) if collect else (Y, S)
 
 
 # ---------------------------------------------------------------------------
@@ -376,11 +433,14 @@ class Attention(nn.Module):
         self.q_norm = RMSNorm(self.hd, cfg.rms_norm_eps)  # per-head, on head_dim
         self.k_norm = RMSNorm(self.hd, cfg.rms_norm_eps)
 
-    def __call__(self, x, mask=None, cache=None):
+    def __call__(self, x, mask=None, cache=None, rope_offset=None):
         cfg = self.cfg
         B, L, _ = x.shape
         # read the offset BEFORE update_and_fetch advances it
         offset = cache.offset if cache is not None else 0
+        # The MTP drafter's KV cache starts mid-sequence, so its cache index and
+        # its absolute position differ; let the caller supply the true position.
+        pos = offset if rope_offset is None else rope_offset
 
         if cfg.attn_output_gate:
             # reshape to (B, L, n_heads, 2*hd) then split per head -- NOT a global
@@ -399,8 +459,8 @@ class Attention(nn.Module):
         k = self.k_norm(k).transpose(0, 2, 1, 3)
         v = v.transpose(0, 2, 1, 3)
 
-        q = rope(q, offset, cfg.rotary_dim, cfg.rope_theta)
-        k = rope(k, offset, cfg.rotary_dim, cfg.rope_theta)
+        q = rope(q, pos, cfg.rotary_dim, cfg.rope_theta)
+        k = rope(k, pos, cfg.rotary_dim, cfg.rope_theta)
 
         if cache is not None:
             k, v = cache.update_and_fetch(k, v)
@@ -447,8 +507,7 @@ class GatedDeltaNet(nn.Module):
         conv_state = None if cache is None else cache.conv
         S = None if cache is None else cache.state
 
-        qkv = self.conv1d(self.in_proj_qkv(x), conv_state)
-        qkv, conv_state = qkv
+        qkv, conv_input = self.conv1d(self.in_proj_qkv(x), conv_state)
         qkv = nn.silu(qkv)
 
         # contiguous [q | k | v] layout
@@ -473,10 +532,19 @@ class GatedDeltaNet(nn.Module):
         A = mx.exp(self.A_log.astype(mx.float32))
         alpha = mx.exp(-A * nn.softplus(a + self.dt_bias.astype(mx.float32)))
 
+        if S is None:
+            S = mx.zeros((B, self.nv, self.dk, self.dv), mx.float32)
+        S_prev = S
+
         # Prefill uses the chunked scan (sequential depth L/64 instead of L);
         # decode is a single step, where chunking would only pad 1 -> 64.
         # CHUNK_THRESHOLD is module-level so tests can force either path.
-        if L >= CHUNK_THRESHOLD:
+        recording = cache is not None and cache.record
+        states = None
+        if recording:
+            # speculative blocks are short; collect per-step states for rollback
+            o, S, states = sequential_delta(q, k, v, alpha, beta, S, collect=True)
+        elif L >= CHUNK_THRESHOLD:
             o, S = chunked_delta(q, k, v, alpha, beta, S)
         else:
             o, S = sequential_delta(q, k, v, alpha, beta, S)
@@ -484,8 +552,14 @@ class GatedDeltaNet(nn.Module):
         z = self.in_proj_z(x).reshape(B, L, self.nv, self.dv)
         o = self.norm(o, z).astype(x.dtype).reshape(B, L, self.z_dim)
         if cache is not None:
-            cache.conv, cache.state = conv_state, S
-            cache.offset += L
+            if recording:
+                # speculative: do not advance the state; keep the per-step states
+                cache.base_offset = cache.offset
+                cache.pending = (conv_input, S_prev, states)
+            else:
+                cache.conv = conv_input[:, -(self.K - 1):]
+                cache.state = S
+                cache.offset += L
         return self.out_proj(o)
 
 
@@ -507,7 +581,7 @@ class _DepthwiseConv(nn.Module):
         xp = mx.concatenate([pad, x], axis=1)              # (B, L+K-1, C)
         w = self.weight[:, 0, :].T                          # (K, C)
         y = sum(xp[:, j : j + L, :] * w[j] for j in range(self.K))
-        return y, xp[:, -(self.K - 1) :, :]                 # new conv state
+        return y, xp   # xp is the full padded input; the last K-1 rows are the state
 
 
 # ---------------------------------------------------------------------------
@@ -527,9 +601,9 @@ class MLP(nn.Module):
 
 
 class Layer(nn.Module):
-    def __init__(self, cfg: TextConfig, i: int):
+    def __init__(self, cfg: TextConfig, i: int, force_full: bool = False):
         super().__init__()
-        self.layer_type = cfg.layer_types[i]
+        self.layer_type = "full_attention" if force_full else cfg.layer_types[i]
         self.is_linear = self.layer_type == "linear_attention"
         self.input_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
@@ -539,15 +613,62 @@ class Layer(nn.Module):
             self.self_attn = Attention(cfg)
         self.mlp = MLP(cfg.hidden_size, cfg.intermediate_size)
 
-    def __call__(self, x, mask=None, cache=None):
+    def __call__(self, x, mask=None, cache=None, rope_offset=None):
         h = self.input_layernorm(x)
         # caches are mutated in place, so nothing is returned
         if self.is_linear:
             h = self.linear_attn(h, cache)
         else:
-            h = self.self_attn(h, mask, cache)
+            h = self.self_attn(h, mask, cache, rope_offset)
         x = x + h
         return x + self.mlp(self.post_attention_layernorm(x))
+
+
+class MTPDraft(nn.Module):
+    """Multi-Token Prediction head, used here as a self-speculative drafter.
+
+    Trained as an auxiliary objective (predict token t+2 as well as t+1), which
+    densifies the training signal and forces h_t to encode more than the
+    immediate next token. At inference it doubles as a draft model:
+
+        h_t (target's final hidden, post-norm) ---> pre_fc_norm_hidden ---.
+        emb(token t+1) (target's embedding table) -> pre_fc_norm_embedding -'
+                            concat -> fc (10240 -> 5120)
+                            -> 1 full-attention decoder layer
+                            -> norm -> the target's OWN lm_head
+
+    ~424M params, 1.6% of the model. Note the layer is full attention, not
+    DeltaNet, and both the embedding table and the LM head are shared with the
+    target (`mtp_use_dedicated_embeddings: false`, and no mtp lm_head is stored).
+    """
+
+    def __init__(self, cfg: TextConfig):
+        super().__init__()
+        h = cfg.hidden_size
+        self.fc = nn.Linear(2 * h, h, bias=False)
+        self.pre_fc_norm_embedding = RMSNorm(h, cfg.rms_norm_eps)
+        self.pre_fc_norm_hidden = RMSNorm(h, cfg.rms_norm_eps)
+        self.layers = [Layer(cfg, 0, force_full=True)
+                       for _ in range(max(1, cfg.mtp_num_hidden_layers))]
+        self.norm = RMSNorm(h, cfg.rms_norm_eps)
+
+    def make_cache(self) -> List:
+        return [KVCache() for _ in self.layers]
+
+    def __call__(self, token_embed, hidden, cache, rope_offset):
+        h = mx.concatenate([self.pre_fc_norm_embedding(token_embed),
+                            self.pre_fc_norm_hidden(hidden)], axis=-1)
+        h = self.fc(h)
+        L = h.shape[1]
+        mask = None
+        if L > 1:
+            off = cache[0].offset
+            qq = mx.arange(off, off + L)[:, None]
+            kk = mx.arange(off + L)[None, :]
+            mask = mx.where(kk <= qq, 0.0, mx.finfo(h.dtype).min).astype(h.dtype)
+        for layer, c in zip(self.layers, cache):
+            h = layer(h, mask, c, rope_offset)
+        return self.norm(h)
 
 
 class Qwen35(nn.Module):
@@ -558,14 +679,17 @@ class Qwen35(nn.Module):
         self.layers = [Layer(cfg, i) for i in range(cfg.num_hidden_layers)]
         self.norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
         self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
+        # named `mtp` so the checkpoint's mtp.* keys land here directly, which
+        # means strict loading and the quantization predicate just work
+        if cfg.mtp_num_hidden_layers:
+            self.mtp = MTPDraft(cfg)
 
     def make_cache(self) -> List:
         """One cache object per layer: KVCache for full attention, DeltaCache otherwise."""
         return [DeltaCache() if t == "linear_attention" else KVCache()
                 for t in self.cfg.layer_types]
 
-    def __call__(self, ids: mx.array, cache: Optional[List] = None,
-                 all_logits: bool = True):
+    def hidden_states(self, ids: mx.array, cache: Optional[List] = None):
         x = self.embed_tokens(ids)
         L = ids.shape[1]
 
@@ -583,12 +707,19 @@ class Qwen35(nn.Module):
         for layer, c in zip(self.layers, cache):
             x = layer(x, mask, c)
 
+        # post-norm hidden: this is exactly the tensor fed to lm_head, and it is
+        # what the MTP drafter consumes (it applies its own pre_fc_norm_hidden)
+        return self.norm(x), cache
+
+    def __call__(self, ids: mx.array, cache: Optional[List] = None,
+                 all_logits: bool = True):
+        h, cache = self.hidden_states(ids, cache)
         # Generation only ever needs the last position. Projecting all L positions
         # through a 248320-wide lm_head costs 5120*248320 flops per token and
         # materializes an L x 248320 tensor (1 GB at L=2048), for nothing.
         if not all_logits:
-            x = x[:, -1:]
-        return self.lm_head(self.norm(x)), cache
+            h = h[:, -1:]
+        return self.lm_head(h), cache
 
 
 # ---------------------------------------------------------------------------
@@ -616,7 +747,7 @@ def load(path: str, verbose: bool = True) -> Tuple[Qwen35, TextConfig]:
     skipped = 0
     for f in sorted(glob.glob(os.path.join(path, "*.safetensors"))):
         for k, v in mx.load(f).items():
-            if k.startswith("model.visual.") or k.startswith("mtp."):
+            if k.startswith("model.visual."):
                 skipped += 1
                 continue
             weights[k.removeprefix("model.language_model.")] = v
@@ -629,5 +760,5 @@ def load(path: str, verbose: bool = True) -> Tuple[Qwen35, TextConfig]:
     if verbose:
         nbytes = sum(v.nbytes for v in weights.values())
         print(f"loaded {len(weights)} tensors, {nbytes / 1e9:.2f} GB "
-              f"({skipped} vision/mtp tensors skipped)")
+              f"({skipped} vision tensors skipped)")
     return model, cfg
