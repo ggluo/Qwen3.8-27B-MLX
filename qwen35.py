@@ -60,6 +60,8 @@ from typing import List, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
+import delta_kernel
+
 
 # ---------------------------------------------------------------------------
 # config
@@ -129,10 +131,17 @@ class RMSNorm(nn.Module):
         super().__init__()
         self.weight = mx.zeros((dims,))
         self.eps = eps
+        self._gamma = None      # leading underscore => MLX does not treat it as a param
 
     def __call__(self, x):
-        w = 1.0 + self.weight.astype(mx.float32)
-        return mx.fast.rms_norm(x.astype(mx.float32), w, self.eps).astype(x.dtype)
+        # Cache (1 + w) in fp32. Recomputing it per call costs two extra kernel
+        # launches on a 5120-element array, and there are ~161 live norms per
+        # forward pass -- ~322 launches per token for a value that never changes.
+        if self._gamma is None or self._gid != id(self.weight):
+            self._gamma = 1.0 + self.weight.astype(mx.float32)
+            self._gid = id(self.weight)
+            mx.eval(self._gamma)
+        return mx.fast.rms_norm(x.astype(mx.float32), self._gamma, self.eps).astype(x.dtype)
 
 
 class GatedRMSNorm(nn.Module):
@@ -148,10 +157,14 @@ class GatedRMSNorm(nn.Module):
         super().__init__()
         self.weight = mx.ones((dims,))
         self.eps = eps
+        self._gamma = None
 
     def __call__(self, x, z):
-        h = mx.fast.rms_norm(x.astype(mx.float32),
-                             self.weight.astype(mx.float32), self.eps)
+        if self._gamma is None or self._gid != id(self.weight):
+            self._gamma = self.weight.astype(mx.float32)
+            self._gid = id(self.weight)
+            mx.eval(self._gamma)
+        h = mx.fast.rms_norm(x.astype(mx.float32), self._gamma, self.eps)
         return h * nn.silu(z.astype(mx.float32))
 
 
@@ -285,6 +298,15 @@ class DeltaCache:
 # use the per-token recurrence. Set to a huge number to force sequential.
 CHUNK_THRESHOLD = 16
 
+# The fused Metal kernel (delta_kernel.py) beats both MLX paths up to ~L=384.
+# Above that the chunked scan's time-parallelism wins: the kernel is serial in t
+# (one thread per (b,h,dv)), which is memory-optimal but exposes no parallelism
+# across time, while the chunked scan turns time into matmuls.
+# Measured, 48 chained layers: L=1 2.4 vs 6.7ms | L=64 20 vs 133ms |
+#                              L=256 88 vs 138ms | L=512 190 vs 164ms
+METAL_MAX_L = 384
+USE_METAL_DELTA = True
+
 
 def _invert_unit_lower(Tm: mx.array, C: int) -> mx.array:
     """Inverse of a batched unit-lower-triangular matrix by forward substitution.
@@ -357,6 +379,8 @@ def chunked_delta(q, k, v, alpha, beta, S, C: int = 64):
 
     if S is None:
         S = mx.zeros((B, H, Dk, Dv), mx.float32)
+    else:
+        S = mx.swapaxes(S, -1, -2)      # (B,H,Dv,Dk) -> (B,H,Dk,Dv) internally
     ys = []
     for c in range(nC):                                       # only L/C steps
         ys.append(MU0[:, :, c] + Qeff[:, :, c] @ S)
@@ -365,21 +389,23 @@ def chunked_delta(q, k, v, alpha, beta, S, C: int = 64):
         S = (cumg_last[:, :, c][..., None, None] * S
              + mx.swapaxes(k[:, :, c], -1, -2) @ Us)
     Y = mx.stack(ys, axis=2).transpose(0, 2, 3, 1, 4).reshape(B, Lp, H, Dv)[:, :L]
-    return Y, S
+    return Y, mx.swapaxes(S, -1, -2)    # back to (B,H,Dv,Dk)
 
 
 @partial(mx.compile, shapeless=True)
 def _delta_step(q_t, k_t, v_t, a_t, b_t, S):
-    """One gated-delta step, fused.
+    """One gated-delta step. State is (B, H, Dv, Dk).
 
-    Unfused this is ~7 elementwise/reduce kernels on a 3.1 MB state, per layer,
-    per token -- ~340 launches per token across 48 layers, which is launch-bound
-    rather than bandwidth-bound. mx.compile fuses the chain into far fewer
-    kernels and roughly halves decode cost.
+    The (Dv, Dk) layout is deliberate: it makes each Dv row contiguous over Dk,
+    which is what the fused Metal kernel in delta_kernel.py needs so that both
+    reductions stay inside one thread. mx.compile fuses this chain as far as MLX
+    can; the Metal kernel goes further (state read once instead of ~7 times).
+
+    q_t, k_t: (B,H,1,Dk)   v_t: (B,H,Dv,1)   a_t,b_t: (B,H,1,1)
     """
-    kS = mx.sum(k_t * S, axis=2, keepdims=True)          # k^T S
-    S = a_t * (S - b_t * (k_t * kS)) + b_t * (k_t * v_t)
-    return mx.sum(q_t * S, axis=2), S                    # S^T q, new state
+    kS = mx.sum(k_t * S, axis=-1, keepdims=True)         # k . S  -> (B,H,Dv,1)
+    S = a_t * (S - b_t * (kS * k_t)) + b_t * (v_t * k_t)
+    return mx.sum(q_t * S, axis=-1), S                   # q . S  -> (B,H,Dv)
 
 
 def sequential_delta(q, k, v, alpha, beta, S, collect=False):
@@ -394,12 +420,12 @@ def sequential_delta(q, k, v, alpha, beta, S, collect=False):
     """
     B, L, H, Dk = q.shape
     if S is None:
-        S = mx.zeros((B, H, Dk, v.shape[-1]), mx.float32)
+        S = mx.zeros((B, H, v.shape[-1], Dk), mx.float32)
     outs, states = [], []
     for t in range(L):
-        o_t, S = _delta_step(q[:, t][..., None],
-                             k[:, t][..., None],
-                             v[:, t][:, :, None, :],
+        o_t, S = _delta_step(q[:, t][:, :, None, :],
+                             k[:, t][:, :, None, :],
+                             v[:, t][..., None],
                              alpha[:, t][:, :, None, None],
                              beta[:, t][:, :, None, None],
                              S)
@@ -533,17 +559,26 @@ class GatedDeltaNet(nn.Module):
         alpha = mx.exp(-A * nn.softplus(a + self.dt_bias.astype(mx.float32)))
 
         if S is None:
-            S = mx.zeros((B, self.nv, self.dk, self.dv), mx.float32)
+            S = mx.zeros((B, self.nv, self.dv, self.dk), mx.float32)
         S_prev = S
 
         # Prefill uses the chunked scan (sequential depth L/64 instead of L);
         # decode is a single step, where chunking would only pad 1 -> 64.
         # CHUNK_THRESHOLD is module-level so tests can force either path.
         recording = cache is not None and cache.record
+        use_metal = (USE_METAL_DELTA and delta_kernel.available()
+                     and L <= METAL_MAX_L)
         states = None
         if recording:
             # speculative blocks are short; collect per-step states for rollback
-            o, S, states = sequential_delta(q, k, v, alpha, beta, S, collect=True)
+            if use_metal:
+                o, S, states = delta_kernel.gated_delta_metal(
+                    q, k, v, alpha, beta, S, collect=True)
+            else:
+                o, S, states = sequential_delta(q, k, v, alpha, beta, S,
+                                                collect=True)
+        elif use_metal:
+            o, S = delta_kernel.gated_delta_metal(q, k, v, alpha, beta, S)
         elif L >= CHUNK_THRESHOLD:
             o, S = chunked_delta(q, k, v, alpha, beta, S)
         else:

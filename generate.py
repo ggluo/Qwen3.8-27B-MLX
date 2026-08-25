@@ -49,16 +49,18 @@ def sample(logits: mx.array, temp: float, top_p: float, top_k: int) -> mx.array:
 
 
 def generate(model, tk, prompt: str, max_tokens=200, temp=1.0, top_p=0.95,
-             top_k=20, stream=True, prefill_step=1024):
+             top_k=20, stream=True, prefill_step=384):
     ids = tk.encode(prompt)
     x = mx.array([ids])
 
     t0 = time.time()
-    # Prefill in windows. Peak memory during prefill scales with the window, not
-    # with the prompt length -- activations run ~5 GB per 1024 tokens on top of
-    # the 16 GB of weights, so a 4096-token prompt in one shot peaks ~36 GB.
-    # Windowing keeps that flat and costs nothing: segmented prefill is exact
-    # (see test_model.py "chunked prefill == full forward").
+    # Prefill in windows. Peak memory scales with the window, not the prompt:
+    # measured on a 2048-token prefill, peak was 16.9 GB at window 384 vs 21.4 GB
+    # at 1024 and 26.3 GB at 2048 (which pushed decode into swap). Throughput is
+    # flat (190-198 tok/s) because prefill is MLP-compute-bound, so the small
+    # window is free. 384 also matches METAL_MAX_L, so the fused delta kernel --
+    # not the chunked scan -- handles prefill. Segmented prefill is exact (see
+    # test_model.py "chunked prefill == full forward").
     logits, cache = None, model.make_cache()
     for s in range(0, x.shape[1], prefill_step):
         logits, cache = model(x[:, s:s + prefill_step], cache, all_logits=False)

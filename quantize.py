@@ -13,18 +13,17 @@ compounds through the recurrence -- they are only ~0.25M params, so keeping them
 in bf16 costs nothing and removes a whole class of risk.
 
     python quantize.py Qwen3.8-27B qwen3.5-27b-4bit
+    python quantize.py Qwen3.8-27B qwen3.5-27b-8bit --bits 8
+    python quantize.py Qwen3.8-27B qwen3.5-27b-4bit-mtpbf16 --keep-mtp-bf16
 """
 
+import argparse
 import json
 import os
 import shutil
-import sys
 import time
 
 import mlx.core as mx
-
-GROUP_SIZE = 64
-BITS = int(os.environ.get("QBITS", 4))
 
 # substrings that force a tensor to stay in bf16
 KEEP_FP = (
@@ -38,13 +37,25 @@ KEEP_FP = (
     "patch_embed",   # 5-D conv kernel
 )
 
+# The MTP draft head (8 modules: mtp.fc plus mtp.layers.0's 4 attention and 3 MLP
+# projections, ~424M params). The reference ships a "bf16 MTP sidecar" -- it never
+# quantizes the drafter, on the theory that its job is to GUESS well and
+# quantization error there costs acceptance rate on every round.
+#
+# MEASURED on a coding prompt at k=3: keeping it bf16 moved acceptance 87% -> 90%
+# and the speedup 1.86x -> 1.87x, i.e. noise, for +0.61 GB. So it is OFF by
+# default here. Kept as a flag because the effect may differ on other prompts.
+KEEP_FP_MTP = ("mtp.",)
 
-def should_quantize(name: str, arr: mx.array) -> bool:
+
+def should_quantize(name: str, arr: mx.array, group_size: int,
+                    keep_mtp: bool) -> bool:
     if arr.ndim != 2:
         return False
-    if any(s in name for s in KEEP_FP):
+    skip = KEEP_FP + (KEEP_FP_MTP if keep_mtp else ())
+    if any(s in name for s in skip):
         return False
-    if arr.shape[-1] % GROUP_SIZE != 0:
+    if arr.shape[-1] % group_size != 0:
         return False
     if arr.size < 1 << 20:  # leave anything under ~1M params alone
         return False
@@ -52,8 +63,18 @@ def should_quantize(name: str, arr: mx.array) -> bool:
 
 
 def main():
-    src = sys.argv[1] if len(sys.argv) > 1 else "Qwen3.8-27B"
-    dst = sys.argv[2] if len(sys.argv) > 2 else "qwen3.5-27b-4bit"
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("src", nargs="?", default="Qwen3.8-27B")
+    ap.add_argument("dst", nargs="?", default="qwen3.5-27b-4bit")
+    ap.add_argument("--bits", type=int, default=4, choices=(2, 3, 4, 6, 8))
+    ap.add_argument("--group-size", type=int, default=64)
+    ap.add_argument("--keep-mtp-bf16", action="store_true",
+                    help="leave the 8 MTP draft-head modules in bf16 (+0.61 GB; "
+                         "measured worth ~0 for acceptance -- see KEEP_FP_MTP)")
+    args = ap.parse_args()          # not `a`: the shard loop below uses `a` for arrays
+    src, dst = args.src, args.dst
+    BITS, GROUP_SIZE, KEEP_MTP = args.bits, args.group_size, args.keep_mtp_bf16
     os.makedirs(dst, exist_ok=True)
 
     index = json.load(open(os.path.join(src, "model.safetensors.index.json")))
@@ -70,7 +91,7 @@ def main():
         for name in sorted(w):
             a = w[name]
             in_bytes += a.nbytes
-            if should_quantize(name, a):
+            if should_quantize(name, a, GROUP_SIZE, KEEP_MTP):
                 wq, scales, biases = mx.quantize(a, group_size=GROUP_SIZE, bits=BITS)
                 out[name] = wq
                 out[name.removesuffix(".weight") + ".scales"] = scales
@@ -105,6 +126,7 @@ def main():
         "bits": BITS,
         # explicit list so the loader knows exactly which modules to swap
         "quantized_modules": sorted(set(quantized_names)),
+        "mtp_kept_bf16": KEEP_MTP,
     }
     json.dump(cfg, open(os.path.join(dst, "config.json"), "w"), indent=2)
 
@@ -118,7 +140,8 @@ def main():
     print(f"\n{in_bytes / 1e9:.1f} GB bf16 -> {out_bytes / 1e9:.1f} GB "
           f"({BITS}-bit, group {GROUP_SIZE})  =  {in_bytes / out_bytes:.2f}x smaller")
     print(f"{len(set(quantized_names))} modules quantized, "
-          f"{len(new_map) - 3 * len(set(quantized_names))} tensors left in bf16")
+          f"{len(new_map) - 3 * len(set(quantized_names))} tensors left in bf16"
+          f"{'  (MTP head kept bf16)' if KEEP_MTP else ''}")
     print(f"wrote {dst}/  in {time.time() - t0:.0f}s")
 
 
