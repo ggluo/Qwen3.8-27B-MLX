@@ -1,4 +1,4 @@
-# Qwen3.8-27B in MLX
+# [Qwen3.8-27B in MLX](https://huggingface.co/Qwen/Qwen3.8-27B)
 
 A from-scratch [MLX](https://github.com/ml-explore/mlx) implementation of
 **Qwen3.8-27B** (`model_type: qwen3_5`) — a 27B hybrid linear-attention
