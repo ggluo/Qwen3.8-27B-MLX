@@ -180,9 +180,9 @@ This was the bulk of the work. In order:
 | # | experiment | outcome |
 |---|---|---|
 | 1 | Layer-wise activation stats | Healthy (resid 1.1→5.1, no blowup) but logits *flat* (max 4.59, rms 0.99) → semantic bug, not numerical |
-| 2 | Dequantization fidelity | 9.7 % weight error — **normal** for 4-bit affine (theory: ~0.115σ/0.8σ). Not the cause |
+| 2 | Dequantization fidelity | 9.7 % weight error — **normal** for 4-bit affine (theory: $\approx 0.115\sigma / 0.8\sigma$). Not the cause |
 | 3 | Ablate each attention type | **Flawed test.** "No attention → garbage" is the *expected* result of removing 64 layers. Proved nothing; I said so and moved on |
-| 4 | **Parameter statistics** | `post_attention_layernorm` gammas are *all ≤ 0*, mean −0.217. As a multiplicative gain that would negate and annihilate the block input → these are **zero-centered gammas**, `x̂·(1+w)` |
+| 4 | **Parameter statistics** | `post_attention_layernorm` gammas are *all ≤ 0*, mean −0.217. As a multiplicative gain that would negate and annihilate the block input → these are **zero-centered gammas**, $\hat{x}\cdot(1+w)$ |
 | 5 | Perplexity as the objective | Replaced eyeballing with NLL/token. Plain `w`: 13.565. `(1+w)`: **5.14**. First real progress |
 | 6 | Sweep norm groups | `+1` on pre-norms, QK-norms, final norm — but **not** the DeltaNet gated norm (whose gammas already center at 0.87) |
 | 7 | Grid DeltaNet layout | contiguous `[q|k|v]` vs grouped, repeat-interleave vs tile, gate-then-norm vs norm-then-gate → baseline best |
@@ -300,8 +300,9 @@ fixing for a model advertising 256 K, even though current prompts won't notice.
 
 ## Stage 10 — Chunked prefill scan
 
-The recurrence `S_t = α(I − βkkᵀ)S_{t−1} + βkvᵀ` is **affine in `S_{t−1}`**, so
-within a chunk of C=64 it unrolls into matmuls. The `(I − βkkᵀ)` factors compose
+The recurrence $S_t = \alpha_t(I - \beta_t kk^{\top})S_{t-1} + \beta_t kv^{\top}$
+is **affine in $S_{t-1}$**, so within a chunk of C=64 it unrolls into matmuls.
+The $(I - \beta kk^{\top})$ factors compose
 into a unit lower-triangular matrix needing one batched C×C triangular solve per
 chunk. Only the chunk-to-chunk handoff stays sequential: **L/64 steps instead of
 L**.
@@ -355,7 +356,8 @@ Registering it as a submodule named `mtp` made the checkpoint's `mtp.*` keys lan
 directly, so strict loading and the quantization predicate worked unchanged.
 
 **The hard part is rollback.** A KV cache rolls back by truncation, but
-delta-rule updates *cannot be un-applied* — `S_t = α(I − βkkᵀ)S_{t−1} + βkvᵀ`
+delta-rule updates *cannot be un-applied* —
+$S_t = \alpha(I - \beta kk^{\top})S_{t-1} + \beta kv^{\top}$
 destroys information about `S_{t−1}`. Three approaches, tried in order:
 
 1. **Tape + replay** — store `(q,k,v,α,β,conv_input)` (~21 MB) and replay the
@@ -370,8 +372,8 @@ destroys information about `S_{t−1}`. Three approaches, tried in order:
 Then the user cloned **MTPLX**, which changed the design substantially:
 
 - **Exact rejection sampling** (Leviathan/Chen). Mine was greedy-only. Accept `d`
-  with probability `min(1, p(d)/q(d))`; on rejection emit a draw from the
-  normalized residual `max(0, p−q)`. Exact at *any* temperature, and greedy falls
+  with probability $\min\!\big(1,\ p(d)/q(d)\big)$; on rejection emit a draw from
+  the normalized residual $\max(0,\ p-q)$. Exact at *any* temperature, and greedy falls
   out as the case where `to_probs` returns a one-hot — one code path.
 - **The draft temperature is free.** Since `p` and `q` are derived
   independently, it cannot affect correctness — only acceptance rate.
@@ -388,7 +390,8 @@ Metal kernel of Stage 12).
 > strength of one noisy single-run sweep. Re-measured properly it is **worse**:
 > at a target temp of 0.7, matching the draft temp to the target gives 78 %
 > acceptance and 31.8 tok/s, while 0.3 gives 63 % and 28.1. The theory says so
-> too — acceptance is `sum_d min(p,q) = 1 - TV(p,q)`, maximized when `q ≈ p`, so
+> too — acceptance is $\sum_d \min\big(p(d), q(d)\big) = 1 - \operatorname{TV}(p,q)$,
+> maximized when $q \approx p$, so
 > sharpening the draft moves it away from the target. The default (draft temp =
 > target temp) was always right; the advice was not.
 
@@ -439,7 +442,7 @@ quantized matmul and not worth attacking.
 
 > **Two measurement bugs found on the way here.** First, my microbenchmark built
 > N identical graphs and only `mx.eval`-ed the last one, so MLX never computed
-> the other N−1 — it reported 1655 GB/s on a 400 GB/s machine. Second, once
+> the other $N-1$ — it reported 1655 GB/s on a 400 GB/s machine. Second, once
 > fixed, per-call `mx.eval` overhead (~0.4 ms) dominated everything at this
 > scale. The fix was to stop microbenchmarking and attribute cost by ablation
 > inside the real model, where 53 ms >> overhead. An earlier estimate of "the
@@ -450,11 +453,13 @@ quantized matmul and not worth attacking.
 One thread per `(batch, head, dv)`. Each thread owns state row `S[b,h,v,:]` —
 128 contiguous floats — and computes both reductions over its **own** row:
 
-```
-kS[v]    = sum_dk k[dk] * S[v,dk]
-S[v,dk] <- a*(S[v,dk] - b*kS[v]*k[dk]) + b*v[v]*k[dk]
-o[v]     = sum_dk q[dk] * S[v,dk]
-```
+$$
+\begin{aligned}
+kS[v] \;&=\; \textstyle\sum_{d_k} k[d_k]\, S[v, d_k] \\
+S[v, d_k] \;&\leftarrow\; a\big(S[v,d_k] - b\, kS[v]\, k[d_k]\big) + b\, v[v]\, k[d_k] \\
+o[v] \;&=\; \textstyle\sum_{d_k} q[d_k]\, S[v, d_k]
+\end{aligned}
+$$
 
 No cross-thread communication, no threadgroup memory, every thread independent.
 
@@ -483,7 +488,7 @@ B/L/H shapes, including the `collect` variant.
 | 256 | — | 138 ms | **88 ms** | 1.6× |
 | 512 | — | **164 ms** | 190 ms | chunked wins |
 
-Crossover at **L ≈ 384**: the kernel is serial in time (memory-optimal, no
+Crossover at $L \approx 384$: the kernel is serial in time (memory-optimal, no
 time-parallelism), while the chunked scan turns time into matmuls. So the model
 now picks the kernel below 384 and the chunked scan above it.
 

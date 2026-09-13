@@ -54,10 +54,11 @@ shows up in RoPE — `rope(x, offset, ...)` must be given the offset, not `0`.
 
 ### The one rule that gets you 95% of the way
 
-A matmul against a weight matrix of shape `(out, in)` costs `2 · in · out` FLOPs
-per token — one multiply and one add per weight. Therefore:
+A matmul against a weight matrix of shape `(out, in)` costs
+$2 \cdot \mathrm{in} \cdot \mathrm{out}$ FLOPs per token — one multiply and one
+add per weight. Therefore:
 
-> **FLOPs/token ≈ 2 × (number of weights used)**
+$$\text{FLOPs/token} \;\approx\; 2 \times (\text{number of weights used})$$
 
 That's it. For a dense transformer, forward FLOPs per token is just twice the
 parameter count (minus the embedding table, which is a lookup, not a matmul).
@@ -82,14 +83,17 @@ on the tin.
 
 Per-component derivations:
 
-```
-MLP        3 · H · I                       = 3 · 5120 · 17408   = 267 M   per layer
-Attention  (2·nq·hd)·H + 2·(nkv·hd)·H + (nq·hd)·H               = 105 M   per layer
-             ^^ q_proj is DOUBLE width: [Q | output gate] per head
-DeltaNet   (2·nk·dk + nv·dv)·H + (nv·dv)·H + 2·nv·H + (nv·dv)·H = 116 M   per layer
-             ^^ in_proj_qkv        ^^ in_proj_z   ^^ a,b   ^^ out_proj
-lm_head    V · H = 248320 · 5120                                = 1.27 B
-```
+$$
+\begin{aligned}
+\text{MLP} \;&=\; 3 H I &&=\; 3 \cdot 5120 \cdot 17408 &&=\; 267\,\mathrm{M} \ \text{per layer} \\
+\text{Attention} \;&=\; \underbrace{2 n_q d_h H}_{\texttt{q\_proj}} + \underbrace{2 n_{kv} d_h H}_{\texttt{k,v}} + \underbrace{n_q d_h H}_{\texttt{o\_proj}} &&&&=\; 105\,\mathrm{M} \ \text{per layer} \\
+\text{DeltaNet} \;&=\; \underbrace{(2 n_k d_k + n_v d_v)H}_{\texttt{in\_proj\_qkv}} + \underbrace{n_v d_v H}_{\texttt{in\_proj\_z}} + \underbrace{2 n_v H}_{a,\,b} + \underbrace{n_v d_v H}_{\texttt{out\_proj}} &&&&=\; 116\,\mathrm{M} \ \text{per layer} \\
+\text{lm\_head} \;&=\; V H &&=\; 248320 \cdot 5120 &&=\; 1.27\,\mathrm{B}
+\end{aligned}
+$$
+
+Note $\texttt{q\_proj}$ is **double width** — it emits $[\,Q \mid \text{gate}\,]$
+per head, hence the factor $2 n_q d_h$.
 
 **The MLP is two-thirds of all the arithmetic.** Attention gets all the
 attention; the feed-forward network does the computing.
@@ -99,9 +103,8 @@ attention; the feed-forward network does the computing.
 **(a) Context-dependent attention.** `QK^T` and `AV` use no weights at all, so
 they scale with context length `S`, not with parameters:
 
-```
-2 · 2 · n_heads · head_dim · S     per full-attention layer per token
-```
+$$2 \cdot 2 \cdot n_\text{heads} \cdot d_\text{head} \cdot S
+\qquad\text{per full-attention layer, per token}$$
 
 | context | GFLOP/token | as % of weight FLOPs |
 |---|---:|---:|
@@ -126,10 +129,12 @@ for it. See the launch-bound regime in §3.
 1. **Bytes moved** per pass. At 4-bit that is ~**15.4 GB** of weights — read
    *once per pass, independent of `L`*. This is the key asymmetry.
 2. **FLOPs** = `51.24 × L` GFLOP.
-3. **Arithmetic intensity** `I = FLOPs / bytes` (FLOP per byte).
+3. **Arithmetic intensity** $I = \dfrac{\text{FLOPs}}{\text{bytes}}$ (FLOP per byte).
 
-Compare `I` against the **machine balance** = `peak FLOP/s ÷ peak bandwidth`.
-If `I < balance`, you are memory-bound.
+Compare $I$ against the **machine balance**:
+
+$$B = \frac{\text{peak FLOP/s}}{\text{peak bandwidth}}
+\qquad\text{if } I < B \text{ you are memory-bound.}$$
 
 ### Measured on this machine
 
@@ -142,12 +147,13 @@ each extra L : ~0 GB extra                      and  2.85 TFLOP/s
 variant), while 0.97 TFLOP/s is barely a third of the 2.85 TFLOP/s the *same
 chip* reaches once compute is the limit. So:
 
-```
-arithmetic intensity at L=1  =  51.24 GFLOP / 15.4 GB  =   3.3 FLOP/byte
-machine balance              =  2.85e12 / 291e9        =   9.8 FLOP/byte
-
-3.3  <<  9.8      ->  MEMORY bound at L=1
-```
+$$
+\begin{aligned}
+I &= \frac{51.24\ \mathrm{GFLOP}}{15.4\ \mathrm{GB}} = 3.3\ \text{FLOP/byte} \\[4pt]
+B &= \frac{2.85 \times 10^{12}}{291 \times 10^{9}} = 9.8\ \text{FLOP/byte} \\[4pt]
+I &\ll B \;\Longrightarrow\; \textbf{memory bound at } L=1
+\end{aligned}
+$$
 
 At `L=1` the GPU spends most of its time waiting for weights to arrive. The
 arithmetic units are ~66 % idle.
@@ -156,17 +162,14 @@ arithmetic units are ~66 % idle.
 
 Compute time catches up with memory time at:
 
-```
-53 ms (read all the weights)  /  18 ms (compute one more position)  =  L ≈ 2.9
-```
+$$L^{*} = \frac{53\ \mathrm{ms}\ \text{(read all the weights)}}
+{18\ \mathrm{ms}\ \text{(compute one more position)}} \approx 2.9$$
 
 **This number sets the ceiling for speculative decoding in this repo.** Each
-round costs `53 + 18·(L−1)` ms and emits `tok/pass` tokens, so the break-even
-depth depends entirely on how many drafts get accepted:
+round costs $53 + 18(L-1)$ ms and emits $\text{tok/pass}$ tokens, so the
+break-even depth depends entirely on how many drafts get accepted:
 
-```
-speedup  =  tok_per_pass × 53 ms  /  (53 + 18·k) ms
-```
+$$\text{speedup} \;=\; \frac{\text{tok/pass} \times 53}{53 + 18k}$$
 
 Speculative decoding works **only** in the memory-bound regime: it spends
 otherwise-idle compute to avoid re-reading the weights. Once `k` pushes the
@@ -250,16 +253,23 @@ would have predicted the problem — only the gap between the two did.
 
 ## 5. Quick reference
 
-```
-FLOPs/token           ≈ 2 × (params − embedding)
-+ attention           ≈ 2 · 2 · n_heads · head_dim · context · n_full_layers
-bytes/pass            ≈ model size on disk (weights dominate at batch 1)
-arithmetic intensity  = FLOPs / bytes
-machine balance       = peak FLOP/s ÷ peak GB/s
-  intensity < balance → memory bound → speculation / quantization help
-  intensity > balance → compute bound → only fewer FLOPs help
-speculation ceiling   = (time to read weights) / (time to compute one position)
-```
+$$
+\begin{aligned}
+\text{FLOPs/token} &\approx 2 \times (\text{params} - \text{embedding}) \\
+\text{+ attention} &\approx 2 \cdot 2 \cdot n_\text{heads} \cdot d_\text{head}
+                       \cdot \text{context} \cdot n_\text{full layers} \\
+\text{bytes/pass} &\approx \text{model size on disk (weights dominate at batch 1)} \\
+I &= \text{FLOPs} \,/\, \text{bytes} \\
+B &= \text{peak FLOP/s} \,/\, \text{peak GB/s} \\
+L^{*} &= \frac{\text{time to read the weights}}{\text{time to compute one position}}
+\end{aligned}
+$$
+
+$$I < B \;\Rightarrow\; \text{memory bound} \;\Rightarrow\;
+\text{speculation and quantization help}$$
+
+$$I > B \;\Rightarrow\; \text{compute bound} \;\Rightarrow\;
+\text{only fewer FLOPs help}$$
 
 For this model on this machine: **51.24 GFLOP/token, 15.4 GB/pass,
-3.3 FLOP/byte, balance 9.8, speculation ceiling L ≈ 2.9.**
+$I = 3.3$, $B = 9.8$, speculation ceiling $L^{*} \approx 2.9$.**
