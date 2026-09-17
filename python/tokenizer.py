@@ -268,7 +268,24 @@ class Tokenizer:
 # --------------------------------------------------------------------------
 
 
-def _self_test(path="Qwen3.8-27B/tokenizer.json"):
+def _default_tokenizer() -> str:
+    """First checkpoint directory that has a tokenizer.json.
+
+    The sources live in python/ and the checkpoints at the repository root, so a
+    fixed relative path would only work from one of the two.
+    """
+    import os
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for name in ("Qwen3.8-27B", "qwen3.5-27b-4bit-uncensored", "qwen3.5-27b-4bit"):
+        cand = os.path.join(root, name, "tokenizer.json")
+        if os.path.exists(cand):
+            return cand
+    raise SystemExit("no checkpoint with a tokenizer.json found; pass one as argv[1]")
+
+
+def _self_test(path=None):
+    if path is None:
+        path = _default_tokenizer()
     tk = Tokenizer(path)
     print(f"vocab {len(tk.vocab)}  merges {len(tk.ranks)}  special {len(tk.added)}")
     print(f"eos_id {tk.eos_id}  bos_id {tk.bos_id}")
@@ -334,5 +351,5 @@ def _self_test(path="Qwen3.8-27B/tokenizer.json"):
 
 if __name__ == "__main__":
     import sys
-    p = sys.argv[1] if len(sys.argv) > 1 else "Qwen3.8-27B/tokenizer.json"
+    p = sys.argv[1] if len(sys.argv) > 1 else None
     raise SystemExit(0 if _self_test(p) else 1)

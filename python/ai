@@ -1,0 +1,14 @@
+#!/bin/sh
+# Local AI assistant.  Install with:  ln -s "$PWD/ai" /usr/local/bin/ai
+#
+# Resolves its own directory, following symlinks, so the launcher keeps working
+# from anywhere on PATH and survives the project being moved.
+self=$0
+while [ -L "$self" ]; do
+  link=$(readlink "$self")
+  case $link in
+    /*) self=$link ;;
+    *)  self=$(dirname "$self")/$link ;;
+  esac
+done
+exec python3 "$(cd "$(dirname "$self")" && pwd)/chat.py" "$@"

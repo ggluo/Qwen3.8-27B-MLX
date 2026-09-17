@@ -23,7 +23,8 @@ PROSE = ("The history of computing is often told as a story of hardware, but the
          "between program and input began to dissolve.")
 
 
-def main(path="qwen3.5-27b-4bit"):
+def main(path="qwen3.5-27b-4bit-uncensored"):
+    path = qwen35.find_model(path)
     tk = Tokenizer(f"{path}/tokenizer.json")
     model, cfg = qwen35.load(path)
     ok = True

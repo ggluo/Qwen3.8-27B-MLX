@@ -1,3 +1,0 @@
-#!/bin/sh
-# Local AI assistant.  Install with:  ln -s "$PWD/ai" /usr/local/bin/ai
-exec python3 /Users/gluo/Documents/llm/chat.py "$@"

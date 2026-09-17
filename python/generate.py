@@ -111,8 +111,9 @@ def main():
     a = ap.parse_args()
 
     mx.random.seed(a.seed)
-    tk = Tokenizer(f"{a.model}/tokenizer.json")
-    model, _ = qwen35.load(a.model)
+    path = qwen35.find_model(a.model)
+    tk = Tokenizer(f"{path}/tokenizer.json")
+    model, _ = qwen35.load(path)
 
     p = a.raw if a.raw is not None else chat_prompt(a.prompt, a.system, not a.no_think)
     print(f"--- prompt ---\n{p}\n--- output ---")

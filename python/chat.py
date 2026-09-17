@@ -318,13 +318,9 @@ def main():
     a = ap.parse_args()
 
     # Resolve the model relative to this script, not the cwd, so a launcher on
-    # PATH works from any directory.
-    path = a.model
-    if not os.path.isdir(path):
-        here = os.path.join(os.path.dirname(os.path.abspath(__file__)), path)
-        if not os.path.isdir(here):
-            raise SystemExit(f"model directory not found: {a.model}")
-        path = here
+    # PATH works from any directory. Checkpoints live at the repository root,
+    # one level above this file.
+    path = qwen35.find_model(a.model)
 
     t0 = time.time()
     print(f"loading {os.path.basename(path)} ...", file=sys.stderr, flush=True)

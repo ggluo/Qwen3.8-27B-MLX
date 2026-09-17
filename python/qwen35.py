@@ -762,7 +762,26 @@ class Qwen35(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+def find_model(path: str) -> str:
+    """Resolve a model directory given as a bare name or a path.
+
+    The sources live in python/ while the checkpoints sit at the repository root,
+    so `--model qwen3.5-27b-4bit` has to work whether you run from the root, from
+    python/, or from anywhere else via the `ai` launcher. Tries the path as given,
+    then relative to this file, then relative to its parent.
+    """
+    if os.path.isdir(path):
+        return path
+    here = os.path.dirname(os.path.abspath(__file__))
+    for base in (here, os.path.dirname(here)):
+        cand = os.path.join(base, path)
+        if os.path.isdir(cand):
+            return cand
+    raise SystemExit(f"model directory not found: {path}")
+
+
 def load(path: str, verbose: bool = True) -> Tuple[Qwen35, TextConfig]:
+    path = find_model(path)
     cfg_path = os.path.join(path, "config.json")
     cfg = TextConfig.from_json(cfg_path)
     raw = json.load(open(cfg_path))

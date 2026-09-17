@@ -328,8 +328,9 @@ def main():
     if a.selftest:
         raise SystemExit(0 if selftest() else 1)
 
-    tk = Tokenizer(f"{a.model}/tokenizer.json")
-    model, _ = qwen35.load(a.model)
+    path = qwen35.find_model(a.model)
+    tk = Tokenizer(f"{path}/tokenizer.json")
+    model, _ = qwen35.load(path)
     p = a.raw if a.raw is not None else chat_prompt(a.prompt, None, not a.no_think)
 
     mx.random.seed(a.seed)

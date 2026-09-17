@@ -12,9 +12,12 @@ in_proj_a, in_proj_b). Those last ones feed exp()/softplus(), where 4-bit error
 compounds through the recurrence -- they are only ~0.25M params, so keeping them
 in bf16 costs nothing and removes a whole class of risk.
 
-    python quantize.py Qwen3.8-27B qwen3.5-27b-4bit
-    python quantize.py Qwen3.8-27B qwen3.5-27b-8bit --bits 8
-    python quantize.py Qwen3.8-27B qwen3.5-27b-4bit-mtpbf16 --keep-mtp-bf16
+Checkpoints live at the repository root, one level above this file. Bare names are
+resolved there, so these work from either directory:
+
+    python3 quantize.py Qwen3.8-27B qwen3.5-27b-4bit
+    python3 quantize.py Qwen3.8-27B qwen3.5-27b-8bit --bits 8
+    python3 quantize.py Qwen3.8-27B qwen3.5-27b-4bit-mtpbf16 --keep-mtp-bf16
 """
 
 import argparse
@@ -24,6 +27,11 @@ import shutil
 import time
 
 import mlx.core as mx
+
+import qwen35
+
+# The repository root, where the checkpoint directories live.
+_CHECKPOINT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # substrings that force a tensor to stay in bf16
 KEEP_FP = (
@@ -73,7 +81,11 @@ def main():
                     help="leave the 8 MTP draft-head modules in bf16 (+0.61 GB; "
                          "measured worth ~0 for acceptance -- see KEEP_FP_MTP)")
     args = ap.parse_args()          # not `a`: the shard loop below uses `a` for arrays
-    src, dst = args.src, args.dst
+    # `src` must already exist, so resolve it; `dst` is being created, so place a
+    # bare name next to the other checkpoints rather than inside python/.
+    src = qwen35.find_model(args.src)
+    dst = args.dst if os.path.isabs(args.dst) or os.sep in args.dst \
+        else os.path.join(_CHECKPOINT_ROOT, args.dst)
     BITS, GROUP_SIZE, KEEP_MTP = args.bits, args.group_size, args.keep_mtp_bf16
     os.makedirs(dst, exist_ok=True)
 
