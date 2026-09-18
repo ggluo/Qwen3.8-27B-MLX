@@ -51,7 +51,7 @@ o_t &= S_t^{\top} q_t
 \end{aligned}
 $$
 
-with the decay $a_t = \exp\!\big(\!-\!\exp(A_{\log})\cdot\operatorname{softplus}(a + \mathrm{dt\_bias})\big) \in (0,1)$
+with the decay $a_t = \exp\!\big(\!-\!\exp(A_{\log})\cdot\mathrm{softplus}(a + \mathrm{dt\_bias})\big) \in (0,1)$
 and the write strength $b_t = \sigma(b)$.
 
 Two conventions in this model are **silent** — get them wrong and you get fluent
