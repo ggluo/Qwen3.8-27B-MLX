@@ -1,4 +1,4 @@
-# [Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B), from scratch, twice
+# [Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B), from scratch
 
 A from-scratch implementation of **Qwen3.8-27B** (`model_type: qwen3_5`) — a 27B
 hybrid linear-attention vision-language model — plus a terminal assistant built on
