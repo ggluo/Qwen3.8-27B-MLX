@@ -520,6 +520,60 @@ So the smaller window is free in time and saves 4.5 GB.
 
 ---
 
+## Stage 13 — Pictures (`vision.py`, then `cpp/src/{image,vision}.cpp`)
+
+### A reference, this time
+
+The text model had none, which is why two of its conventions took grid searches
+to find. The vision tower turned out to have one: its 333 `model.visual.*`
+tensors match transformers' `Qwen3VLVisionModel` name for name and shape for
+shape. So every stage was held against transformers before anything was built on
+it — the decoder against PIL, preprocessing against `Qwen2VLImageProcessor`, the
+tower in fp32 against the reference with the same weights (~2×10⁻⁵), and the
+M-RoPE positions against `get_rope_index`. With a reference, the two silent
+conventions in the tower (the merger's erf GELU next to the blocks' tanh one, and
+the 2×2-block patch order) never became bugs.
+
+### Decoding the same way twice
+
+Pictures are decoded by macOS ImageIO in both ports — through `ctypes` in Python —
+and resized by the same double-precision bicubic weights fed to the same MLX
+matmul. That was chosen so the ports could be compared byte for byte, and it
+needed `-ffp-contract=off` in the C++ build: clang fuses `a*b + c` into an FMA,
+which rounds once where Python rounds twice.
+
+### Wrong turns
+
+- **"Bit-exact" that wasn't.** The first preprocessing comparison printed four
+  decimals and showed `0.0000`; it was 1.2×10⁻⁷ — one fp32 ULP, from the
+  reference normalising at a different precision. The pixels themselves are
+  identical, and the test now says exactly that.
+- **The cross-port divergence was not in the vision code.** Replies about a
+  picture differed a few words in. Bisecting by stage — patches, then vision
+  features, then the hidden state after prefill — showed all three bit-identical,
+  which put it in decoding: Python rotated text positions by hand, C++ called
+  `mx.fast.rope`. Equivalent, not identical, and text-only replies had never
+  landed on a margin close enough to show it. Both now call the kernel.
+- **A refused picture wiped the cached conversation.** Serve mode reset the
+  session for a non-continuing request *before* looking at its pictures, so a bad
+  one discarded a good cache. Validation now happens first.
+- **A test that could not fail.** The half-to-even rounding check passed
+  multiples of 32 and so never rounded anything.
+- **The tie, again.** Speculative and plain decoding differ with a picture in
+  context on the 27B — 15 tokens in, `1.` against `-`, one bf16 step apart. Same
+  caveat as Stage 11; the tests now measure the gap at a divergence instead of
+  demanding equality.
+
+### A null result
+
+M-RoPE could not be shown to matter behaviourally. On grids of coloured squares,
+real M-RoPE, sequential positions and a transposed grid all answer the same
+questions: the tower's own 2-D rotary and position table already put each
+patch's location into its features. The positions follow the reference exactly,
+so they stay — on the strength of the match, not of an ablation.
+
+---
+
 ## Cross-cutting lessons
 
 1. **Get an objective metric early.** Fourteen experiments became tractable only
@@ -546,10 +600,8 @@ So the smaller window is free in time and saves 4.5 GB.
 
 ## Not implemented
 
-- **Vision tower** (499 tensors, loaded-but-skipped) — text-only despite being a
-  VLM. Needs the ViT, patch embedding, and the merger.
-- **True M-RoPE for images.** For text, all three position axes are equal so
-  M-RoPE reduces *exactly* to standard RoPE. Images break that equality.
+- **Video.** Stage 13 does pictures; frames and the timestamps Qwen3-VL puts
+  between them are not fed.
 - **YaRN scaling** for context beyond 262 144.
 - **More Metal kernels.** The gated-delta step now has one (Stage 12). The
   references have ~99, including fused SwiGLU MLP, 2-pass paged SDPA, and MoE

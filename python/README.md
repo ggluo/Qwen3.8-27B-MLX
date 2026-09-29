@@ -1,8 +1,8 @@
 # Qwen3.5-27B in Python (MLX)
 
-The original from-scratch implementation: the model, the byte-level BPE tokenizer,
-the quantizer, speculative decoding, a fused Metal kernel and the line editor —
-no Transformers, no `tokenizers`, no network.
+The original from-scratch implementation: the model, its vision tower, the
+byte-level BPE tokenizer, the quantizer, speculative decoding, a fused Metal kernel
+and the line editor — no Transformers, no `tokenizers`, no PIL, no network.
 
 Commands below are written as run from this directory. See
 [`../README.md`](../README.md) for the architecture and how this relates to the
@@ -39,6 +39,7 @@ Follow-ups revise the previous answer — the conversation is kept in context.
 | `/think [on\|off]` | show reasoning (dimmed); off by default for speed |
 | `/temp <float>` | sampling temperature (`0` = deterministic; `0.7` default) |
 | `/system <text>` | system prompt; applies on the next `/new` |
+| `/image <path>...` | attach pictures to your next message; `/image` lists them, `/image clear` drops them |
 | `/paste` | type a multi-line message, end with a single `.` line |
 | `/stats` | tokens, tok/s, model passes, draft acceptance, context size |
 | `/help`, `/exit` | Ctrl-D also quits |
@@ -65,6 +66,23 @@ the new user turn is prefilled. Measured over a growing conversation:
 Startup is ~1.5–3 s (mmap of the 4-bit weights), so keep the session open rather
 than relaunching per question. Peak memory ~16.3 GB.
 
+### Pictures
+
+```
+> /image ~/Desktop/receipt.jpg
+attached receipt.jpg: 4032x3024 -> 1152x864, 972 tokens
+> What's the total, and which shop is it from?
+```
+
+Drag a file into the terminal to type its path — `/image` splits paths the way a
+shell does, so Terminal's `My\ Photo.png` works. `--image` attaches a picture to
+the first message; `--max-pixels` caps the size (default 1,048,576: every 32×32 is
+one token, so at most 1024 tokens a picture). A picture stays in the context, so
+follow-ups need no re-attaching. `vision.py` has the pipeline and the three
+conventions in it that fail silently; [`../cpp/README.md`](../cpp/README.md#pictures)
+explains the M-RoPE positions and the *rope delta* the session carries after a
+picture.
+
 ### Why paste needed its own module
 
 `input()` cannot read a pasted paragraph. The tty is in canonical mode, so it
@@ -89,7 +107,8 @@ on its own — you press Return**, the same semantic as a modern shell.
 | `chat.py` | The assistant: interactive REPL, cache reuse across turns, ephemeral |
 | `ai` | Self-locating launcher shim |
 | `lineread.py` | Raw-mode line reader with correct multi-line paste handling |
-| `qwen35.py` | The model: RMSNorm/GatedRMSNorm, RoPE, gated attention, GatedDeltaNet, MTP head, KV/Delta caches, chunked + sequential delta rule |
+| `qwen35.py` | The model: RMSNorm/GatedRMSNorm, RoPE and M-RoPE, gated attention, GatedDeltaNet, MTP head, KV/Delta caches, chunked + sequential delta rule, `prefill` for prompts with pictures |
+| `vision.py` | The vision tower, and everything between an image file and it: ImageIO decoding (via `ctypes`), EXIF orientation, the resize rule, bicubic, patching |
 | `tokenizer.py` | Byte-level BPE, stdlib only (hand-rolled GPT-4 regex split) |
 | `quantize.py` | bf16 → 4/8-bit, streamed shard by shard |
 | `generate.py` | One-shot generation with streaming |
@@ -97,6 +116,7 @@ on its own — you press Return**, the same semantic as a modern shell.
 | `delta_kernel.py` | Fused Metal kernel for the gated-delta recurrence (**in use**) |
 | `mlp_kernel.py` | Batched quantized mat-vec kernel — a documented **negative result**, not wired in |
 | `test_model.py` | 16 model correctness tests |
+| `test_vision.py` | The vision path, stage by stage, against transformers' Qwen3-VL |
 
 Checkpoint directories live at the repository root, one level up. `--model` takes
 a bare name and is resolved by `qwen35.find_model` — as given, then relative to
@@ -106,7 +126,9 @@ this directory, then to its parent — so every entry point works from either pl
 
 - Apple Silicon Mac. The Metal kernel needs a GPU; without it the model falls
   back to the pure-MLX path automatically, just slower.
-- `mlx` (`pip3 install mlx`). Nothing else — the rest is stdlib.
+- `mlx` (`pip3 install mlx`). Nothing else — the rest is stdlib, pictures included:
+  they are decoded by macOS ImageIO through `ctypes`, which is also exactly the
+  decoder the C++ port calls.
 - A quantized checkpoint directory (below). The bf16 source is 55.6 GB and will
   not fit in 48 GB.
 
@@ -151,6 +173,7 @@ step, so the port loads what this produces rather than reimplementing it.
 python3 generate.py "Explain what a KV cache is." -n 400
 python3 generate.py --raw "The capital of France is" --temp 0 -n 20
 python3 speculative.py "Write a Python function to merge two sorted lists." -k 3 -n 200
+python3 generate.py "What is in this picture?" --image photo.jpg --no-think
 ```
 
 Common flags: `--model`, `--temp`, `--top-p`, `--top-k`, `-n/--max-tokens`,
@@ -251,7 +274,31 @@ python3 lineread.py         # 7 line-editor tests, driven through a real pty
 python3 speculative.py --selftest   # rejection-sampling marginal == target
 python3 delta_kernel.py     # Metal kernel vs. the reference recurrence
 python3 mlp_kernel.py       # qmv kernel vs. QuantizedLinear (correctness only)
+python3 test_vision.py      # the vision path, against transformers' Qwen3-VL
 ```
+
+**`test_vision.py`** holds each stage of the picture path against the reference
+it has, because the checkpoint's vision tower is — tensor for tensor, all 333 —
+Qwen3-VL's encoder, which transformers implements:
+
+| stage | against | result |
+|---|---|---|
+| decoding | PIL, with `exif_transpose` | PNGs identical; the JPEG within 1 level (the two IDCTs) |
+| resize, normalise, patch | transformers' `Qwen2VLImageProcessor` | identical pixels; values within one fp32 ULP |
+| the tower, in fp32 | transformers' `Qwen3VLVisionModel`, same weights | ~2e-5 relative |
+| M-RoPE positions | transformers' `get_rope_index`, two pictures, windows cutting through both | identical |
+| answers | the model | the number in a picture, a sideways-stored arrow, text on transparency, recall across turns and pictures |
+
+Those comparisons need torch, transformers and PIL; they are test-only
+dependencies, and the tests that use them are skipped when they are missing.
+
+One thing the tests could **not** show is that M-RoPE matters to the answers. On
+3×5 grids of coloured squares, real M-RoPE, strictly sequential positions and a
+transposed grid all answer the same 14 of 15 questions: the tower's own 2-D rotary
+and position table already build each patch's place into its features, and
+probes like these cannot tell the schemes apart. The positions here follow the
+reference exactly, so they are kept — but that rests on matching the reference,
+not on a behavioural test.
 
 The model tests cover the parts that actually break: cached decode == full
 forward, chunked prefill == full forward, prefill+incremental == full forward,

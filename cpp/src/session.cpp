@@ -287,20 +287,18 @@ void Session::reset() {
   tokens_.clear();
   cache_ = model_.make_cache();
   turns_ = 0;
+  rope_delta_ = 0;
+  pending_.clear();
   mx::clear_cache();
 }
 
 mx::array Session::sync() {
   const int lo = cache_.empty() ? 0 : cache_[0].offset();
-  const int total = static_cast<int>(tokens_.size());
-  mx::array h = mx::zeros({1, 1, model_.cfg.hidden_size});
-  for (int s = lo; s < total; s += prefill_step_) {
-    const int end = std::min(s + prefill_step_, total);
-    mx::array ids(tokens_.begin() + s, {1, end - s}, mx::int32);
-    h = model_.hidden_states(ids, cache_);
-    mx::eval(h);
-  }
-  return last_step(h);
+  const std::vector<int> need(tokens_.begin() + lo, tokens_.end());
+  std::pair<mx::array, int> r = prefill(model_, cache_, need, pending_, rope_delta_, prefill_step_);
+  rope_delta_ = r.second;
+  pending_.clear();
+  return r.first;
 }
 
 void Session::close_turn() {
@@ -313,24 +311,51 @@ void Session::close_turn() {
 
 void Session::turn(const std::string& text, bool think, float temp, float top_p,
                    int top_k, int max_tokens,
-                   const std::function<void(const std::string&)>& emit) {
+                   const std::function<void(const std::string&)>& emit,
+                   const std::vector<image::Image>& images) {
   Message user;
   user.role = "user";
-  user.content = text;
+  for (size_t i = 0; i < images.size(); ++i) user.content += kImagePlaceholder;
+  user.content += text;
   turn_prompt(render_chat({user}, turns_ == 0 ? system : std::string(), think), temp,
-              top_p, top_k, max_tokens, emit);
+              top_p, top_k, max_tokens, emit, images);
 }
 
 void Session::turn_prompt(const std::string& prompt, float temp, float top_p,
                           int top_k, int max_tokens,
-                          const std::function<void(const std::string&)>& emit) {
-  const size_t before = tokens_.size();
-  std::vector<int> ids = tk_.encode(prompt);
-  tokens_.insert(tokens_.end(), ids.begin(), ids.end());
-
+                          const std::function<void(const std::string&)>& emit,
+                          const std::vector<image::Image>& images) {
   const double t0 = now_s();
+  // Everything that can fail happens before the token list is touched, so a bad
+  // picture leaves the conversation exactly as it was.
+  std::vector<int> ids = tk_.encode(prompt);
+  const int pad = model_.cfg.image_token_id;
+  std::vector<ImageFeatures> feats;
+  if (images.empty()) {
+    if (std::find(ids.begin(), ids.end(), pad) != ids.end()) {
+      throw std::runtime_error("the message contains a literal <|image_pad|> token");
+    }
+  } else {
+    std::vector<int> counts;
+    for (const image::Image& im : images) counts.push_back(im.n_tokens());
+    ids = expand_image_pads(ids, counts, pad);
+    std::vector<mx::array> embeds;
+    for (const image::Image& im : images) {
+      feats.push_back(ImageFeatures{model_.embed_image(im), im.rows(), im.cols()});
+      embeds.push_back(feats.back().embeds);
+    }
+    mx::eval(embeds);
+  }
+  const double vision_t = now_s() - t0;
+
+  const size_t before = tokens_.size();
+  tokens_.insert(tokens_.end(), ids.begin(), ids.end());
+  pending_.insert(pending_.end(), feats.begin(), feats.end());
+
   last_ = Stats{};
   last_.prompt_n = static_cast<int>(tokens_.size() - before);
+  last_.images = static_cast<int>(images.size());
+  last_.vision_t = vision_t;
 
   mx::array h = sync();
   int first = sample::sample_probs(
@@ -364,7 +389,8 @@ void Session::plain_loop(mx::array h, int tok, std::vector<int>& emitted, float 
   std::string printed = tk_.decode(emitted);
   while (last_.n < max_tokens) {
     if (interrupt_pending()) return;
-    h = model_.hidden_states(one(tok), cache_);
+    // after an image the rope position is the cache offset plus rope_delta_
+    h = model_.hidden_states(one(tok), cache_, Rope::at(cache_[0].offset() + rope_delta_));
     tok = sample::sample_probs(
         sample::to_probs(last_row(model_.logits(h)), temp, top_p, top_k));
     if (is_eos(tok)) return;
@@ -395,9 +421,12 @@ void Session::spec_loop(mx::array h, int first, std::vector<int>& emitted, float
   std::string printed = tk_.decode(emitted);
 
   int P = cache_[0].offset();
+  // Every position the drafter and the verify pass use is shifted by the rope
+  // delta -- constant for the whole reply, which holds no images.
+  const int d = rope_delta_;
   mx::array A_tok = one(first);
   mx::array A_hid = h;
-  int A_pos = P;
+  int A_pos = P + d;
   mx::array next_tok = one(first);
 
   while (last_.n < max_tokens) {
@@ -416,7 +445,7 @@ void Session::spec_loop(mx::array h, int first, std::vector<int>& emitted, float
     for (int i = 0; i < k; ++i) {
       if (i) {
         h_prev = mtp(model_.embed_tokens(one(dl.back())), h_prev, mtp_cache,
-                     P_old + i);
+                     P_old + i + d);
       }
       mx::array q =
           sample::to_probs(last_row(model_.logits(h_prev)), temp, top_p, top_k);
@@ -429,7 +458,7 @@ void Session::spec_loop(mx::array h, int first, std::vector<int>& emitted, float
     for (LayerCache& c : cache_) {
       if (c.linear) c.delta.record = true;
     }
-    mx::array h_v = model_.hidden_states(X, cache_);
+    mx::array h_v = model_.hidden_states(X, cache_, Rope::at(P_old + d));
     mx::array tl = model_.logits(h_v);
     std::vector<mx::array> ps;
     ps.reserve(static_cast<size_t>(k) + 1);
@@ -501,6 +530,6 @@ void Session::spec_loop(mx::array h, int first, std::vector<int>& emitted, float
     accepted_toks.back() = corrected;  // already true; kept explicit
     A_tok = row(accepted_toks);
     A_hid = ops::slice_axis(h_v, 1, 0, j + 1);
-    A_pos = P_old + 1;
+    A_pos = P_old + 1 + d;
   }
 }

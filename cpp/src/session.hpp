@@ -15,6 +15,7 @@
 #include <utility>
 #include <vector>
 
+#include "image.hpp"
 #include "model.hpp"
 #include "tokenizer.hpp"
 
@@ -24,8 +25,10 @@ struct Stats {
   int rounds = 0;    // target passes (speculative only)
   int drafted = 0;
   int accepted = 0;
-  double prefill_t = 0;  // seconds spent consuming the prompt
+  double prefill_t = 0;  // seconds spent consuming the prompt, pictures included
   double dt = 0;         // seconds spent generating, excluding prefill
+  int images = 0;        // pictures in this turn's prompt
+  double vision_t = 0;   // seconds of prefill_t spent in the vision tower
 };
 
 // Set from the SIGINT handler; the decode loops poll it at round boundaries.
@@ -43,6 +46,11 @@ void request_interrupt();
 // the chat template
 // ---------------------------------------------------------------------------
 
+// What the template writes for one picture in a message. The single
+// <|image_pad|> is expanded to one per image token when the prompt is tokenized
+// (expand_image_pads), so a rendered prompt holds exactly one of these per image.
+constexpr const char* kImagePlaceholder = "<|vision_start|><|image_pad|><|vision_end|>";
+
 // One function call, either one the model asked for or one a client echoed back.
 struct ToolCall {
   std::string id;         // clients send one; we mint it when we emit one
@@ -59,6 +67,11 @@ struct Message {
   std::string content;
   std::string reasoning;             // assistant only, the part before </think>
   std::vector<ToolCall> tool_calls;  // assistant only
+  // The pictures in `content`, as the encoded bytes the client sent, in the
+  // order of their kImagePlaceholder in the text. Kept as bytes so two requests
+  // can be compared exactly: the same words with a different picture are a
+  // different message.
+  std::vector<std::string> images;
 };
 
 // One entry of a request's `tools` array, already back out as JSON text. The
@@ -118,18 +131,30 @@ class Session {
   // An interrupt stops at a ROUND BOUNDARY, where the token list and every cache
   // already agree, so there is nothing to roll back -- unlike the Python original,
   // which had to unwind a half-finished speculative round after a KeyboardInterrupt.
+  //
+  // `images` are shown to the model ahead of the text, the way the model card
+  // lays a picture out.
   void turn(const std::string& text, bool think, float temp, float top_p, int top_k,
-            int max_tokens, const std::function<void(const std::string&)>& emit);
+            int max_tokens, const std::function<void(const std::string&)>& emit,
+            const std::vector<image::Image>& images = {});
 
   // The same, with the caller supplying the prompt text. `turn()` is this plus
   // render_chat() on one user message; serve mode renders a whole chat from the
   // request's messages, so it comes through here instead. `system` is not
   // consulted -- whatever is in the prompt is what the model sees.
+  //
+  // The prompt carries one `<|vision_start|><|image_pad|><|vision_end|>` per
+  // picture, and `images` are those pictures in the order they appear. Throws,
+  // leaving the conversation untouched, if the two do not match up or the model
+  // has no vision tower.
   void turn_prompt(const std::string& prompt, float temp, float top_p, int top_k,
-                   int max_tokens, const std::function<void(const std::string&)>& emit);
+                   int max_tokens, const std::function<void(const std::string&)>& emit,
+                   const std::vector<image::Image>& images = {});
 
   const Stats& last() const { return last_; }
   size_t context_tokens() const { return tokens_.size(); }
+  const std::vector<int>& tokens() const { return tokens_; }
+  int rope_delta() const { return rope_delta_; }
   bool speculative() const { return spec_; }
 
   std::string system;
@@ -157,4 +182,12 @@ class Session {
   std::vector<LayerCache> cache_;
   int turns_ = 0;
   Stats last_;
+
+  // After an image the rope position runs ahead of the token index -- an image
+  // of r x c tokens advances it by max(r, c), not r*c -- and this is by how much.
+  // Every decode step and every draft uses cache offset + rope_delta_. Decode
+  // loops stop only at round boundaries, never inside a prefill, so an image is
+  // always consumed whole and this never needs recomputing from a prefix.
+  int rope_delta_ = 0;
+  std::vector<ImageFeatures> pending_;  // pictures in tokens_ not yet fed to the model
 };

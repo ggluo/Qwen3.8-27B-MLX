@@ -15,6 +15,7 @@
 #include <utility>
 #include <vector>
 
+#include "image.hpp"
 #include "json.hpp"
 #include "session.hpp"
 
@@ -32,11 +33,23 @@ struct ServeOptions {
   // nothing: this is the one thing here that touches the disk, and it only does
   // so when asked.
   std::string dump_dir;
+  // Pictures above this many pixels are downscaled first; every 32x32 is one
+  // token of prompt.
+  long long max_pixels = image::kMaxPixels;
 };
 
 // Binds, loads the model on the thread that will run it, then serves until
 // SIGINT. Never returns.
 void serve(const std::string& model_dir, const ServeOptions& opt);
+
+// Serves one already-connected socket, exactly as an accepted connection is
+// served, until the peer closes it -- then closes `fd` and returns. The model is
+// loaded on its model thread the first time, and kept for later calls with the
+// same directory.
+//
+// This is how the self-tests drive the real HTTP and request path: they cannot
+// bind a port, but a socketpair() needs no network.
+void serve_socket(const std::string& model_dir, const ServeOptions& opt, int fd);
 
 // ---------------------------------------------------------------------------
 // Pieces the self-tests drive on their own. None of them touch the model.
@@ -108,6 +121,15 @@ class ToolCallParser {
   Types types_;
   std::string buf_;
 };
+
+// A message's `content`: a plain string, or the array of parts the API allows.
+// Text parts are concatenated; each picture becomes kImagePlaceholder in the text
+// and its decoded bytes are appended to `images`, so the two stay in step.
+//
+// Pictures must arrive inline, as `data:<type>;base64,...` URLs. An http(s) URL
+// is refused -- this server never touches the network -- and so is file://,
+// which would let anyone who can reach the port read pictures off this disk.
+std::string flatten_content(const json::Value& content, std::vector<std::string>& images);
 
 // One HTTP request, parsed off the wire.
 struct HttpRequest {

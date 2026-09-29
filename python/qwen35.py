@@ -42,11 +42,12 @@ Two things that make this model hard to reimplement blind, both found here the
 hard way and both silent (fluent nonsense, never an error): the zero-centered
 norm gammas (see RMSNorm) and the gated-norm order (see GatedRMSNorm).
 
-Text-only: M-RoPE (mrope_section [11,11,10]) degenerates EXACTLY to standard
-RoPE when the time/height/width position components are all equal, which is the
-case for text tokens. Images need the real 3-way split; see note in `rope`.
-The vision tower is not loaded. Multi-token prediction IS loaded (see
-MTPDraft) and drives speculative decoding in speculative.py.
+Images: the vision tower is vision.py; its features replace the <|image_pad|>
+token embeddings (Qwen35.hidden_states), and the full-attention layers switch to
+real M-RoPE for them (see `rope` and `prefill`). For text, M-RoPE degenerates
+EXACTLY to standard RoPE -- t, h and w are all the token's position -- so the
+text path is unchanged. Video is not supported. Multi-token prediction is loaded
+too (see MTPDraft) and drives speculative decoding in speculative.py.
 """
 
 import glob
@@ -61,6 +62,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 import delta_kernel
+import vision
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +91,12 @@ class TextConfig:
     linear_value_head_dim: int = 128
     linear_conv_kernel_dim: int = 4
     mtp_num_hidden_layers: int = 0
+    # M-RoPE: how the 32 rotary frequencies split between the (t, h, w) axes
+    mrope_section: Tuple[int, ...] = (11, 11, 10)
+    # multimodal token ids, from the top level of config.json
+    image_token_id: int = 248056
+    vision_start_token_id: int = 248053
+    vision_end_token_id: int = 248054
 
     @classmethod
     def from_json(cls, path: str) -> "TextConfig":
@@ -102,6 +110,10 @@ class TextConfig:
         kw["partial_rotary_factor"] = rope.get(
             "partial_rotary_factor", t.get("partial_rotary_factor", 0.25)
         )
+        kw["mrope_section"] = tuple(rope.get("mrope_section", (11, 11, 10)))
+        for k in ("image_token_id", "vision_start_token_id", "vision_end_token_id"):
+            if k in raw:
+                kw[k] = raw[k]
         return cls(**kw)
 
     @property
@@ -168,19 +180,46 @@ class GatedRMSNorm(nn.Module):
         return h * nn.silu(z.astype(mx.float32))
 
 
-def rope(x: mx.array, offset: int, rotary_dim: int, theta: float) -> mx.array:
+def mrope_axes(rotary_dim: int, section) -> List[int]:
+    """Which position axis -- 0 t, 1 h, 2 w -- each rotary frequency reads.
+
+    INTERLEAVED, not chunked: frequency j goes to h if j % 3 == 1 and to w if
+    j % 3 == 2 (each while its section lasts), and to t otherwise, giving
+    THWTHW...TH for [11, 11, 10]. That is what "mrope_interleaved" means; it
+    says nothing about the rotate_half pairing. Checked against transformers'
+    Qwen3-VL apply_interleaved_mrope.
+    """
+    half = rotary_dim // 2
+    return [1 if (j % 3 == 1 and j < 3 * section[1])
+            else 2 if (j % 3 == 2 and j < 3 * section[2]) else 0
+            for j in range(half)]
+
+
+def rope(x: mx.array, offset, rotary_dim: int, theta: float,
+         section=(11, 11, 10)) -> mx.array:
     """RoPE on the first `rotary_dim` dims of (B, H, L, head_dim); rest passes through.
 
-    For text this is exactly M-RoPE: with mrope_section [11,11,10] the three
-    sections index time/height/width positions, and for a text token all three
-    are the token index, so every section sees the same value. Images break that
-    equality and need the real 3-way position split.
+    `offset` is either an int -- the position of the first of L consecutive
+    tokens, the text case -- or a (3, L) array of explicit (t, h, w) positions,
+    needed as soon as a chunk holds image tokens.
+
+    The int case is M-RoPE with t = h = w: every frequency then reads the same
+    position, whatever axis it is assigned to, so the axis split drops out and it
+    is standard RoPE -- done here by mx.fast.rope, which is also what the C++ port
+    calls. The two ports must use the SAME implementation, not merely equivalent
+    ones: a hand-written rotation differs from the fused kernel in the last bit,
+    and that was enough to flip a near-tied token a few words into an image
+    description. The array case has no fused kernel, so both ports write it out
+    identically.
     """
-    B, H, L, D = x.shape
+    if isinstance(offset, int):
+        return mx.fast.rope(x, rotary_dim, traditional=False, base=theta, scale=1.0,
+                            offset=offset)
     x_rot, x_pass = x[..., :rotary_dim], x[..., rotary_dim:]
     half = rotary_dim // 2
-    pos = mx.arange(offset, offset + L, dtype=mx.float32)[:, None]
     inv = theta ** (-mx.arange(0, half, dtype=mx.float32) / half)[None, :]
+    axes = mx.array(mrope_axes(rotary_dim, section))                      # (half,)
+    pos = mx.take(offset.astype(mx.float32), axes, axis=0).T             # (L, half)
     ang = pos * inv
     cos, sin = mx.cos(ang), mx.sin(ang)
     x1, x2 = x_rot[..., :half], x_rot[..., half:]
@@ -464,8 +503,10 @@ class Attention(nn.Module):
         B, L, _ = x.shape
         # read the offset BEFORE update_and_fetch advances it
         offset = cache.offset if cache is not None else 0
-        # The MTP drafter's KV cache starts mid-sequence, so its cache index and
-        # its absolute position differ; let the caller supply the true position.
+        # The rope position is not always the cache index: the MTP drafter's cache
+        # starts mid-sequence, and after an image the positions run ahead of the
+        # token count (see vision.image_positions). Callers that know better pass
+        # an int, or a (3, L) array of explicit (t, h, w) positions.
         pos = offset if rope_offset is None else rope_offset
 
         if cfg.attn_output_gate:
@@ -485,8 +526,8 @@ class Attention(nn.Module):
         k = self.k_norm(k).transpose(0, 2, 1, 3)
         v = v.transpose(0, 2, 1, 3)
 
-        q = rope(q, pos, cfg.rotary_dim, cfg.rope_theta)
-        k = rope(k, pos, cfg.rotary_dim, cfg.rope_theta)
+        q = rope(q, pos, cfg.rotary_dim, cfg.rope_theta, cfg.mrope_section)
+        k = rope(k, pos, cfg.rotary_dim, cfg.rope_theta, cfg.mrope_section)
 
         if cache is not None:
             k, v = cache.update_and_fetch(k, v)
@@ -707,7 +748,7 @@ class MTPDraft(nn.Module):
 
 
 class Qwen35(nn.Module):
-    def __init__(self, cfg: TextConfig):
+    def __init__(self, cfg: TextConfig, vision_cfg: Optional[vision.VisionConfig] = None):
         super().__init__()
         self.cfg = cfg
         self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
@@ -718,15 +759,45 @@ class Qwen35(nn.Module):
         # means strict loading and the quantization predicate just work
         if cfg.mtp_num_hidden_layers:
             self.mtp = MTPDraft(cfg)
+        # likewise `visual` for model.visual.*
+        if vision_cfg is not None:
+            self.visual = vision.VisionModel(vision_cfg)
+
+    @property
+    def has_vision(self) -> bool:
+        return "visual" in self
 
     def make_cache(self) -> List:
         """One cache object per layer: KVCache for full attention, DeltaCache otherwise."""
         return [DeltaCache() if t == "linear_attention" else KVCache()
                 for t in self.cfg.layer_types]
 
-    def hidden_states(self, ids: mx.array, cache: Optional[List] = None):
+    def embed_image(self, image: "vision.Image") -> mx.array:
+        """One preprocessed image -> (n_tokens, hidden): the embeddings its
+        <|image_pad|> tokens are replaced with."""
+        if not self.has_vision:
+            raise ValueError("this checkpoint has no vision tower")
+        return self.visual(image)
+
+    def hidden_states(self, ids: mx.array, cache: Optional[List] = None,
+                      rope=None, image_embeds: Optional[mx.array] = None):
+        """ids (1, L) -> post-norm hidden states (1, L, hidden).
+
+        rope          None: positions are the cache offsets -- text, no image yet
+                      int: the position of ids[0], later ones consecutive -- text
+                        after an image, where positions run ahead of the offsets
+                      (3, L) array: explicit (t, h, w) -- a chunk with image tokens
+        image_embeds  (n, hidden) features for the n <|image_pad|> tokens in ids,
+                      in order. See `prefill`, which builds both for you.
+        """
         x = self.embed_tokens(ids)
         L = ids.shape[1]
+        if image_embeds is not None:
+            is_img = ids == self.cfg.image_token_id                        # (1, L)
+            # the k-th image token takes the k-th feature row
+            idx = mx.maximum(mx.cumsum(is_img.astype(mx.int32), axis=1) - 1, 0)
+            feats = mx.take(image_embeds.astype(x.dtype), idx[0], axis=0)[None]
+            x = mx.where(is_img[..., None], feats, x)
 
         if cache is None:
             cache = self.make_cache()
@@ -740,7 +811,7 @@ class Qwen35(nn.Module):
             mask = mx.where(kk <= q, 0.0, mx.finfo(x.dtype).min).astype(x.dtype)
 
         for layer, c in zip(self.layers, cache):
-            x = layer(x, mask, c)
+            x = layer(x, mask, c, rope)
 
         # post-norm hidden: this is exactly the tensor fed to lm_head, and it is
         # what the MTP drafter consumes (it applies its own pre_fc_norm_hidden)
@@ -755,6 +826,145 @@ class Qwen35(nn.Module):
         if not all_logits:
             h = h[:, -1:]
         return self.lm_head(h), cache
+
+
+# ---------------------------------------------------------------------------
+# prompts with images
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ImageSpan:
+    """Where one image sits in a token sequence, and its token grid."""
+    start: int      # index of its first <|image_pad|>
+    rows: int
+    cols: int
+
+    @property
+    def n(self) -> int:
+        return self.rows * self.cols
+
+
+def delta_contribution(span: ImageSpan, consumed: Optional[int] = None) -> int:
+    """How far an image pushes the rope position ahead of the token index.
+
+    A full image of rows x cols tokens takes rows*cols token slots but only
+    max(rows, cols) positions, so everything after it sits at
+    index + (max(rows, cols) - rows*cols). The deltas of successive images add.
+    `consumed` < n handles an image cut short (an interrupted prefill): its
+    tokens keep their grid positions and the text resumes one past the largest.
+    """
+    k = span.n if consumed is None else consumed
+    if k <= 0:
+        return 0
+    r_max = (k - 1) // span.cols
+    c_max = span.cols - 1 if k >= span.cols else k - 1
+    return max(r_max, c_max) + 1 - k
+
+
+def expand_image_pads(ids: List[int], counts: List[int], pad: int) -> List[int]:
+    """The template writes one <|image_pad|> per image; the model needs one per
+    image TOKEN. Expand the k-th pad into counts[k] of them."""
+    out, k = [], 0
+    for t in ids:
+        if t == pad:
+            if k >= len(counts):
+                raise ValueError("the text holds more <|image_pad|> tokens than there "
+                                 "are images")
+            out.extend([pad] * counts[k])
+            k += 1
+        else:
+            out.append(t)
+    if k != len(counts):
+        raise ValueError(f"{len(counts)} images but {k} <|image_pad|> placeholders")
+    return out
+
+
+def find_image_spans(ids: List[int], grids: List[Tuple[int, int]], pad: int,
+                     base: int = 0) -> List[ImageSpan]:
+    """Locate each image's run of pad tokens. `grids` are the (rows, cols) of the
+    images in order; `base` is added to every start index."""
+    spans, i, k = [], 0, 0
+    while i < len(ids):
+        if ids[i] != pad:
+            i += 1
+            continue
+        j = i
+        while j < len(ids) and ids[j] == pad:
+            j += 1
+        # adjacent images would merge into one run; split it by the grids
+        while i < j:
+            if k >= len(grids):
+                raise ValueError("more image tokens than images")
+            rows, cols = grids[k]
+            if i + rows * cols > j:
+                raise ValueError(f"image {k + 1} needs {rows * cols} tokens, found {j - i}")
+            spans.append(ImageSpan(base + i, rows, cols))
+            i += rows * cols
+            k += 1
+    if k != len(grids):
+        raise ValueError(f"{len(grids)} images but token runs for {k}")
+    return spans
+
+
+def prefill(model: Qwen35, cache: List, ids: List[int], images=(), delta: int = 0,
+            step: int = 384):
+    """Feed `ids` -- everything the cache has not seen -- in windows of `step`.
+
+    images  (embeds, rows, cols) for each image whose pad tokens are in ids, in
+            order; embeds from model.embed_image
+    delta   the rope offset in force before ids[0] (0 until the first image)
+
+    Returns (hidden at the last position (1, 1, hidden), delta after ids).
+
+    Windows are plain token windows: an image may straddle two, and each window
+    gets its slice of the positions and of the features. A window with no image
+    token in it takes the ordinary scalar rope path even inside a multimodal
+    prompt, since its positions are consecutive.
+    """
+    start = cache[0].offset
+    images = list(images)
+    spans = find_image_spans(ids, [(r, c) for _, r, c in images],
+                             model.cfg.image_token_id) if images else []
+    if spans:
+        feats = mx.concatenate([e for e, _, _ in images], axis=0)
+        # explicit (t, h, w) for every token of the segment
+        pt, ph, pw = [], [], []
+        p, i = start + delta, 0
+        for sp in spans:
+            while i < sp.start:
+                pt.append(p); ph.append(p); pw.append(p)
+                p += 1
+                i += 1
+            t, h, w = vision.image_positions(p, sp.rows, sp.cols)
+            pt += t; ph += h; pw += w
+            p += max(sp.rows, sp.cols)
+            i += sp.n
+        while i < len(ids):
+            pt.append(p); ph.append(p); pw.append(p)
+            p += 1
+            i += 1
+        # image tokens before each index, to slice the features per window
+        before = [0]
+        for t in ids:
+            before.append(before[-1] + (t == model.cfg.image_token_id))
+        new_delta = p - (start + len(ids))
+    else:
+        new_delta = delta
+
+    h = None
+    for s in range(0, len(ids), step):
+        e = min(s + step, len(ids))
+        chunk = mx.array([ids[s:e]])
+        if spans and before[e] > before[s]:
+            rope = mx.array([pt[s:e], ph[s:e], pw[s:e]], dtype=mx.int32)
+            h, cache = model.hidden_states(chunk, cache, rope=rope,
+                                           image_embeds=feats[before[s]:before[e]])
+        else:
+            first = pt[s] if spans else start + s + delta
+            h, cache = model.hidden_states(chunk, cache, rope=first)
+        mx.eval(h)
+    return h[:, -1:], new_delta
 
 
 # ---------------------------------------------------------------------------
@@ -787,32 +997,44 @@ def load(path: str, verbose: bool = True) -> Tuple[Qwen35, TextConfig]:
     raw = json.load(open(cfg_path))
     quant = raw.get("quantization")
 
-    model = Qwen35(cfg)
+    # Read the tensor list first: whether to build a vision tower depends on
+    # whether the checkpoint actually carries one, not just on its config.
+    weights = {}
+    n_visual = 0
+    for f in sorted(glob.glob(os.path.join(path, "*.safetensors"))):
+        for k, v in mx.load(f).items():
+            if k.startswith("model.visual."):
+                n_visual += 1
+            weights[k.removeprefix("model.language_model.").removeprefix("model.")] = v
+
+    vcfg = None
+    if n_visual and "vision_config" in raw:
+        vcfg = vision.VisionConfig.from_dict(raw["vision_config"])
+    elif n_visual:
+        weights = {k: v for k, v in weights.items() if not k.startswith("visual.")}
+    model = Qwen35(cfg, vcfg)
 
     if quant:
         qmods = set(quant["quantized_modules"])
         # our module path -> the HF name recorded in the file
         def pred(p, m):
-            return p in qmods or ("model.language_model." + p) in qmods
+            return (p in qmods or ("model.language_model." + p) in qmods
+                    or ("model." + p) in qmods)
         nn.quantize(model, group_size=quant["group_size"], bits=quant["bits"],
                     class_predicate=pred)
 
-    weights = {}
-    skipped = 0
-    for f in sorted(glob.glob(os.path.join(path, "*.safetensors"))):
-        for k, v in mx.load(f).items():
-            if k.startswith("model.visual."):
-                skipped += 1
-                continue
-            weights[k.removeprefix("model.language_model.")] = v
-
     # strict=True is the real structural check: it fails loudly if any name or
     # shape in our module tree disagrees with the checkpoint.
-
     model.load_weights(list(weights.items()), strict=True)
-    mx.eval(model.parameters())
+
+    # The vision tower (~0.4B params) is left unevaluated: mx.load is lazy, so it
+    # is read from disk the first time an image is embedded, and a text-only
+    # session never pays for it.
+    params = model.parameters()
+    mx.eval({k: v for k, v in params.items() if k != "visual"})
     if verbose:
-        nbytes = sum(v.nbytes for v in weights.values())
-        print(f"loaded {len(weights)} tensors, {nbytes / 1e9:.2f} GB "
-              f"({skipped} vision tensors skipped)")
+        nbytes = sum(v.nbytes for k, v in weights.items() if not k.startswith("visual."))
+        print(f"loaded {len(weights) - n_visual} tensors, {nbytes / 1e9:.2f} GB"
+              + (f" (+{n_visual} vision tensors, read on first image)" if vcfg else
+                 " (no vision tower)"))
     return model, cfg

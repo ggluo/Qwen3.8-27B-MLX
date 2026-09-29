@@ -2,13 +2,14 @@
 
 A from-scratch implementation of **Qwen3.8-27B** (`model_type: qwen3_5`) — a 27B
 hybrid linear-attention vision-language model — plus a terminal assistant built on
-top of it. Written twice against [MLX](https://github.com/ml-explore/mlx): first
-in Python, then ported to C++.
+top of it that reads pictures as well as text. Written twice against
+[MLX](https://github.com/ml-explore/mlx): first in Python, then ported to C++,
+whose serve mode puts it behind an OpenAI-compatible API.
 
-No Transformers, no `tokenizers`, no network. The model, the byte-level BPE
-tokenizer, the quantizer, the speculative decoder, the fused Metal kernel and the
-line editor are all implemented here and verified against the checkpoint. Built
-and measured on an M3 Max with 48 GB of unified memory.
+No Transformers, no `tokenizers`, no PIL, no network. The model, its vision tower,
+the byte-level BPE tokenizer, the quantizer, the speculative decoder, the fused
+Metal kernel and the line editor are all implemented here and verified against the
+checkpoint. Built and measured on an M3 Max with 48 GB of unified memory.
 
 ```
 python/     the original implementation, and the quantizer      -> python/README.md
@@ -18,9 +19,13 @@ cpp/        the port, using MLX's C++ API; no Python at runtime  -> cpp/README.m
 ```bash
 python3 python/chat.py          # the assistant, Python
 cd cpp && make && ./build/ai    # the assistant, C++
+./build/ai --serve              # ... as an OpenAI-compatible server
 ```
 
-Checkpoint directories live here at the root, so both implementations share them.
+In either chat, `/image photo.jpg` attaches a picture to the next message.
+
+Checkpoint directories live here at the root, so both implementations share them;
+`testdata/` holds the small pictures both test suites use.
 
 | Also here | |
 |---|---|
@@ -63,6 +68,39 @@ implementations, with the reasoning:
   weight statistics: `post_attention_layernorm` values are all ≤ 0.
 - **Normalize-then-gate** in the gated RMSNorm. Gating inside the norm divides
   the gate's own magnitude back out. Getting this backwards costs 3.2 nats/token.
+
+## Pictures
+
+The checkpoint's 333 `model.visual.*` tensors are Qwen3-VL's vision encoder,
+name for name and shape for shape — 27 ViT blocks with a 2-D rotary and a learned
+48×48 position table, and a merger that folds each 2×2 block of 16-pixel patches
+into one token. Its output replaces the embeddings of `<|image_pad|>` tokens in
+the prompt, one per token: a picture costs one token per 32×32 pixels, capped by
+default at 1024.
+
+Because the encoder is Qwen3-VL's, transformers is a trustworthy reference for it,
+and the Python port is held against it stage by stage: preprocessing gives
+identical pixels, the tower agrees to ~2×10⁻⁵ in fp32, and the positions are
+identical to `get_rope_index`. The C++ port is then held against the Python —
+bit-identical patches, vision features and post-prefill hidden states, and
+byte-identical replies about the test pictures.
+
+What changes in the text model is the positions. Image tokens take **M-RoPE**: a
+(time, row, column) position each, with the rotary frequencies split between the
+three axes, interleaved `THWTHW…`. A picture of $r \times c$ tokens occupies $rc$
+slots of the context but only $\max(r, c)$ positions, so after the first picture
+the rope position runs ahead of the KV-cache offset by
+
+$$\Delta = \sum_{\text{pictures}} \big(\max(r, c) - rc\big)$$
+
+and every later prefill, decode step, MTP draft and speculative verify has to add
+it. For text, M-RoPE reduces exactly to ordinary RoPE (all three axes equal), so a
+conversation with no pictures is unchanged.
+
+Two conventions in the tower fail silently, like the text model's: the block MLPs
+use the tanh GELU but the merger the exact erf one, and the patches are ordered
+2×2-block-major rather than in raster order, which the position table and rotary
+coordinates have to follow.
 
 ## Two optimizations that pay
 
@@ -130,9 +168,8 @@ pure-MLX path automatically, just slower.
 
 ## Notes and caveats
 
-- **Text-only.** The vision tower is not loaded (499 `model.visual.*` tensors are
-  skipped) despite this being a VLM. For text, M-RoPE degenerates exactly to
-  standard RoPE because the time/height/width position axes are all equal.
+- **Pictures, not video.** The tower's temporal patching would take frames, but
+  neither port feeds them, nor the timestamps Qwen3-VL puts between them.
 - No YaRN scaling, so context beyond the native 262 144 is unsupported.
 - A git-LFS clone of the source keeps a second copy in `.git/lfs`; that is
   ~52 GB you can reclaim once you no longer need to re-quantize.

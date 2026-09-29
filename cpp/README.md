@@ -38,8 +38,8 @@ make test
 ```
 
 Requirements: macOS on Apple silicon, Xcode command line tools, MLX ≥ 0.29
-(checked against 0.29.3 and 0.32.3). CoreFoundation supplies Unicode NFC; Metal
-runs the fused delta kernel.
+(checked against 0.29.3 and 0.32.3). CoreFoundation supplies Unicode NFC, ImageIO
+and CoreGraphics decode pictures, and Metal runs the fused delta kernel.
 
 ### Pointing the build at MLX
 
@@ -111,11 +111,12 @@ delivers what static linking would actually have bought here.
 ./build/ai --temp 0 -k 4                     # greedy, draft 4 tokens per round
 ./build/ai --no-spec                         # plain decoding, no MTP drafting
 ./build/ai --prompt "..." -n 200             # one-shot, non-interactive
+./build/ai --image photo.jpg --prompt "What is in this picture?"
 ./build/ai --serve                           # OpenAI-compatible API on 127.0.0.1:8080
 ```
 
-In-chat commands: `/help` `/new` `/think` `/temp` `/system` `/paste` `/stats`
-`/exit`.
+In-chat commands: `/help` `/new` `/think` `/temp` `/system` `/image` `/paste`
+`/stats` `/exit`.
 
 Paste a multi-line paragraph and press Return — it arrives as one message. `Ctrl-J`
 inserts a newline without sending, `Ctrl-U` clears the line, `Ctrl-C` interrupts a
@@ -126,6 +127,52 @@ all live in memory and die with the process.
 
 `./ai` is a launcher you can symlink onto `PATH`; the binary resolves the model
 directory relative to itself, so it works from any working directory.
+
+## Pictures
+
+Every Qwen3.5 checkpoint carries a vision tower, and the assistant uses it:
+
+```
+> /image ~/Desktop/receipt.jpg
+attached receipt.jpg: 4032x3024 -> 1152x864, 972 tokens
+> What's the total, and which shop is it from?
+```
+
+`/image` takes one or more paths — drag a file into the terminal to type its path;
+the backslash-escaped form Terminal writes is understood — and attaches them to
+your next message. `/image` alone lists what is attached, `/image clear` drops it.
+`--image` does the same for the first message, and works with `--prompt`.
+Follow-up questions about a picture need no re-attaching: it stays in the context,
+and later pictures accumulate alongside it.
+
+JPEG, PNG, HEIC, WebP, TIFF and anything else ImageIO reads. Phone photos are
+turned upright from their EXIF orientation, as the reference loader does.
+
+**Each 32×32 pixels is one token**, so size is what costs. A picture is scaled so
+both sides are multiples of 32 and its area is at least 64 tokens and at most
+`--max-pixels` — by default 1,048,576, i.e. 1024 tokens. The checkpoint's own
+limit is 16.7 M pixels, 16,384 tokens for a single photo, which is minutes of
+prefill on this hardware; 1024 keeps a screenshot's small text legible.
+
+What happens to a picture, in `image.cpp` then `vision.cpp`:
+
+    bytes --ImageIO--> RGB, upright --smart_resize, bicubic--> multiples of 32
+      --(x/255 - 0.5)/0.5, 2 identical frames--> 16x16 patches, 2x2-block order
+      --27 ViT blocks, 2-D rotary, learned 48x48 position table-->
+      --merger: 2x2 patches -> 1 token--> embeddings for the <|image_pad|> tokens
+
+The text model then reads the image tokens with real **M-RoPE**: each carries a
+(time, row, column) position instead of one index, and the rotary frequencies are
+split between the three axes, interleaved `THWTHW…`. An image of `r×c` tokens
+takes `r·c` slots in the context but only `max(r, c)` positions, so after the
+first picture the rope position runs ahead of the KV-cache offset. `Session`
+carries that difference — the *rope delta* — into every later prefill, every
+decode step, the MTP drafter and the speculative verify pass.
+
+Two deliberate differences from the reference loader: **transparency is composited
+over white** (the reference drops alpha and keeps whatever colour a transparent
+pixel stored — usually black, which makes black text on a transparent background
+disappear), and the pixel cap above. Video is not supported.
 
 ## Serve mode
 
@@ -160,6 +207,28 @@ curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/
   "tools": [{"type": "function", "function": {"name": "bash", "description": "Run a command",
              "parameters": {"type": "object", "properties": {"command": {"type": "string"}},
                             "required": ["command"]}}}]}'
+```
+
+**Pictures work too**, as the API's `image_url` content parts:
+
+```
+curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "messages": [{"role": "user", "content": [
+    {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,'"$(base64 -i photo.jpg)"'"}},
+    {"type": "text", "text": "What is in this picture?"}]}]}'
+```
+
+Parts are rendered in order, so text and pictures can interleave. The bare-string
+form `"image_url": "data:..."` and `{"type": "image", "image": "data:..."}` are
+accepted too, since clients send both. Pictures must arrive **inline, as base64
+`data:` URLs**: an `http(s)` URL is refused (this server never touches the
+network), and so is `file://`, which would let anyone who can reach the port read
+pictures off this disk. A picture outside a user message, bytes that are not a
+picture, or a model with no vision tower are all a `400`, answered before
+anything is streamed — and before the session is touched, so the cached
+conversation survives a bad request. Cache reuse compares the pictures' bytes as
+well as the text: the same words about a different picture are a different
+conversation. `--max-pixels` sets the size cap, as in the REPL.
 
 Also `--host` (default `127.0.0.1`: this is a local model, and the default keeps
 it local), `--api-key` (requires `Authorization: Bearer <key>`; `/health` stays
@@ -249,12 +318,15 @@ Four things worth knowing:
 | `src/lineread.{hpp,cpp}` | Raw-mode line reader with correct multi-line paste handling |
 | `src/ops.{hpp,cpp}` | Small array helpers (`slice_axis`, `silu`, `softplus`, `l2norm`) |
 | `src/serve.{hpp,cpp}` | Serve mode: the HTTP/1.1 server, the OpenAI routes, and the one thread that owns the model |
+| `src/image.{hpp,cpp}` | Pictures to patches: ImageIO decoding, EXIF orientation, the resize rule, bicubic, normalisation, patching; base64 |
+| `src/vision.{hpp,cpp}` | The vision tower: patch embedding, position table, 27 ViT blocks, the 2x2 merger |
+| `tools/gen_image_golden.py` | Regenerates `src/image_golden.inc`, which pins the preprocessing to the Python port's |
 | `src/main.cpp` | Argument parsing, the REPL, reasoning-block dimming |
 | `src/tests.cpp` | Self-tests |
 
 ## What is verified
 
-`make test` — 101 checks, all passing (90 of them need no weights at all):
+`make test` — 139 checks, all passing (119 of them need no weights at all):
 
 * **Tokenizer ids are identical to the Python implementation** on 22 cases
   covering contractions, CJK, emoji, combining accents, tabs/CRLF, code fences,
@@ -287,9 +359,36 @@ Four things worth knowing:
   the model's text, including when the tags themselves are split across pieces,
   when the arguments have to be typed as the schema declares, and when a
   `<tool_call>` turns out to be prose after all.
+* **Picture preprocessing is bit-identical to the Python port's** on every test
+  picture — a PNG, an EXIF-rotated JPEG, a transparent PNG, a greyscale one, at
+  sizes that are kept, shrunk and grown — which is itself held against
+  transformers' Qwen2-VL image processor (identical pixels, values within one
+  fp32 ULP). `tools/gen_image_golden.py` records the Python's patch tensors.
+* **The model reads pictures**: the number in one, the direction of an arrow
+  stored sideways with an EXIF tag, black text on a transparent background; a
+  follow-up with no picture, a second picture, then a question about the first —
+  which only works if the rope delta carries across turns and adds up across
+  pictures; and speculative decoding against plain decoding with a picture in
+  context.
+* **Serve mode takes pictures over its real HTTP path**, driven through a
+  `socketpair()` — a test cannot bind a port, but a socket pair needs no network:
+  a picture cold, an echoed history that continues from the cache, a swapped
+  picture that must *not*, every refusal as a `400` with the cached conversation
+  still intact after it, and a streamed reply.
 
-Beyond the suite, the port was checked against the Python end to end: **120 greedy
-tokens on a code prompt are byte-identical** between the two implementations.
+Beyond the suite, the port was checked against the Python end to end: **greedy
+output is byte-identical** between the two, for text and for pictures alike —
+plain and speculative decoding, 150 tokens each, on four test pictures and a code
+prompt, and on both checkpoints the suite runs. For pictures the vision features,
+and the hidden state after the prefill, are bit-identical too.
+
+Where plain and speculative decoding differ, it is the one caveat speculative
+decoding always has in bf16: the verify pass scores `k+1` positions at once and
+plain decode one, so on an **exact** tie of the top two logits the argmax can go
+either way. The tests allow that and nothing else — a divergence passes only if
+the plain model's top two are within bf16 resolution there. On the 27B with a
+picture in context it happens 15 tokens into a list: `1.` or `-`, 25.500 against
+25.375, one bf16 step apart.
 
 ## Measured on an M3 Max (48 GB), 4-bit, `qwen3.5-27b-4bit-uncensored`
 
@@ -325,6 +424,23 @@ at load.
 Acceptance is strongly prompt-dependent in both — 84% on this code prompt, 55% on
 open-ended prose (24.7 tok/s, 1.30×) — and the speedup follows it.
 
+### Pictures
+
+A 12 MP photo (4032×3024, downscaled to 1152×864, 972 tokens), asked to read the
+text in it:
+
+| | 9B, 4-bit | 27B, 4-bit |
+| --- | --- | --- |
+| prefill, picture included | 2.4 s | 6.9 s |
+| … of which the vision tower | 0.7 s | 0.8 s |
+| peak memory | 7.8 GB | 18.6 GB |
+
+The tower's share is small; what a picture costs is its tokens going through the
+text model. The first picture of a session also reads the tower's weights from
+disk — they are left out of the load so a text-only session never pays for them —
+and a 640×480 picture with warm weights takes 0.15 s in the tower. Peak memory is
+~1.7–2.5 GB above text-only.
+
 ## Deliberate differences from the Python
 
 **Interrupts are cooperative, and simpler for it.** Python got interruption free
@@ -342,6 +458,13 @@ loading rather than lazily memoized per norm object.
 **`--prompt` runs one shot.** Added for scripting, and for diffing against the
 Python implementation.
 
+**Rope for text positions is `mx::fast::rope` in both ports.** It used to be a
+hand-written rotation in the Python, mathematically the same as the fused kernel
+but not bit for bit. Text-only replies never landed on a close enough margin to
+show it; describing a picture did, a handful of words in. Now both ports call the
+same kernel for text positions, and write out the same explicit rotation for the
+(t, h, w) positions of a chunk holding image tokens, which has no fused kernel.
+
 ## Not ported
 
 * **The chunked parallel delta scan.** The fused Metal kernel is correct at any
@@ -354,5 +477,5 @@ Python implementation.
   never wired into the model, so there is nothing to port.
 * **`../python/quantize.py`.** Quantization is a one-off offline step; keep using
   the Python tool to produce a checkpoint, which this binary then loads.
-* **The vision tower.** Text only, as in the Python. The 499 `model.visual.*`
-  tensors are skipped at load.
+* **Video.** The tower's temporal patching would take it, but neither port feeds
+  frames or the timestamps Qwen3-VL puts between them.

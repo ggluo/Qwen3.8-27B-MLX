@@ -4,13 +4,14 @@
 //     ./ai --think                # show the model's reasoning
 //     ./ai --system "Be terse."
 //     ./ai --prompt "..." -n 200  # one-shot, non-interactive
+//     ./ai --image photo.jpg --prompt "What is this?"
 //     ./ai --serve                # OpenAI-compatible API on 127.0.0.1:8080
 //
 // Everything lives in memory: the conversation, the KV cache, the editing
 // history. Quit and it is gone. No files are created, and none are read except
 // the model weights.
 //
-// In-chat commands: /help /new /think /temp /system /paste /stats /exit
+// In-chat commands: /help /new /think /temp /system /image /paste /stats /exit
 #include <sys/stat.h>
 
 #include <chrono>
@@ -19,8 +20,11 @@
 #include <algorithm>
 #include <cstring>
 #include <iostream>
+#include <stdexcept>
 #include <string>
+#include <vector>
 
+#include "image.hpp"
 #include "lineread.hpp"
 #include "model.hpp"
 #include "serve.hpp"
@@ -38,6 +42,8 @@ const char* kHelp = R"(
   /think [on|off]   show the model's reasoning (slower)
   /temp <float>     sampling temperature (0 = deterministic)
   /system <text>    set a system prompt (applies to the next /new)
+  /image <path>...  attach pictures to your next message (drag a file here);
+                    /image alone lists them, /image clear drops them
   /paste            type a multi-line message, end with a single "." line
   /stats            timing for the last reply
   /help             this
@@ -136,6 +142,8 @@ struct Args {
   int top_k = 20;
   int draft = 3;
   int max_tokens = 1024;
+  std::vector<std::string> images;  // attached to the first message
+  long long max_pixels = image::kMaxPixels;
 
   // serve mode
   bool serve = false;
@@ -167,6 +175,8 @@ Args parse_args(int argc, char** argv) {
     else if (f == "--top-k") a.top_k = atoi(next().c_str());
     else if (f == "-k" || f == "--draft") a.draft = atoi(next().c_str());
     else if (f == "-n" || f == "--max-tokens") a.max_tokens = atoi(next().c_str());
+    else if (f == "--image") a.images.push_back(next());
+    else if (f == "--max-pixels") a.max_pixels = atoll(next().c_str());
     else if (f == "--serve") a.serve = true;
     else if (f == "--host") a.host = next();
     else if (f == "--port") a.port = atoi(next().c_str());
@@ -176,10 +186,13 @@ Args parse_args(int argc, char** argv) {
     else if (f == "-h" || f == "--help") {
       printf("usage: ai [--model DIR] [--system TEXT] [--think] [--temp F]\n"
              "          [--top-p F] [--top-k N] [-k N] [--no-spec] [-n N]\n"
-             "          [--prompt TEXT]\n"
+             "          [--prompt TEXT] [--image PATH]... [--max-pixels N]\n"
              "       ai --serve [--host IP] [--port N] [--api-key KEY]\n"
-             "          [--model-name NAME] [--dump DIR]\n%s",
-             kHelp);
+             "          [--model-name NAME] [--dump DIR] [--max-pixels N]\n\n"
+             "  --image attaches a picture to the first message (repeatable).\n"
+             "  --max-pixels downscales pictures above N pixels; every 32x32 is one\n"
+             "  token, and the default %lld caps a picture at %lld tokens.\n%s",
+             image::kMaxPixels, image::kMaxPixels / (image::kFactor * image::kFactor), kHelp);
       exit(0);
     } else {
       fprintf(stderr, "unknown option: %s (try --help)\n", f.c_str());
@@ -195,10 +208,16 @@ void print_stats(const Session& s) {
     printf("%sno reply yet%s\n", kDim, kReset);
     return;
   }
-  char buf[320];
-  int len = snprintf(buf, sizeof(buf),
-                     "prefill %.2fs | %d tokens in %.2fs (%.1f tok/s)", st.prefill_t,
-                     st.n, st.dt, st.n / (st.dt > 0 ? st.dt : 1e-9));
+  char buf[400];
+  int len = snprintf(buf, sizeof(buf), "prefill %.2fs", st.prefill_t);
+  if (st.images) {
+    len += snprintf(buf + len, sizeof(buf) - static_cast<size_t>(len),
+                    " (%d picture%s, %.2fs in the vision tower)", st.images,
+                    st.images == 1 ? "" : "s", st.vision_t);
+  }
+  len += snprintf(buf + len, sizeof(buf) - static_cast<size_t>(len),
+                  " | %d tokens in %.2fs (%.1f tok/s)", st.n, st.dt,
+                  st.n / (st.dt > 0 ? st.dt : 1e-9));
   if (st.rounds) {
     len += snprintf(buf + len, sizeof(buf) - static_cast<size_t>(len),
                     " | %d passes, %.2f tok/pass, accept %.0f%%", st.rounds,
@@ -231,11 +250,92 @@ std::string trim(const std::string& s) {
   return s.substr(a, b - a + 1);
 }
 
+// Splits a command argument into paths the way a shell would: whitespace
+// separates, quotes group, and a backslash escapes the next character -- which
+// is what Terminal writes when a file is dragged in (My\ Photo.png). Throws on
+// an unterminated quote.
+std::vector<std::string> split_paths(const std::string& arg) {
+  std::vector<std::string> out;
+  std::string cur;
+  bool have = false;
+  char quote = 0;
+  for (size_t i = 0; i < arg.size(); ++i) {
+    const char c = arg[i];
+    if (quote) {
+      if (c == quote) {
+        quote = 0;
+      } else if (c == '\\' && quote == '"' && i + 1 < arg.size()) {
+        cur += arg[++i];
+      } else {
+        cur += c;
+      }
+    } else if (c == '\'' || c == '"') {
+      quote = c;
+      have = true;
+    } else if (c == '\\' && i + 1 < arg.size()) {
+      cur += arg[++i];
+      have = true;
+    } else if (c == ' ' || c == '\t') {
+      if (have) out.push_back(cur);
+      cur.clear();
+      have = false;
+    } else {
+      cur += c;
+      have = true;
+    }
+  }
+  if (quote) throw std::runtime_error("unterminated quote");
+  if (have) out.push_back(cur);
+  return out;
+}
+
+std::string expand_home(const std::string& p) {
+  if (p.size() >= 1 && p[0] == '~' && (p.size() == 1 || p[1] == '/')) {
+    const char* home = getenv("HOME");
+    if (home) return std::string(home) + p.substr(1);
+  }
+  return p;
+}
+
+struct Attachment {
+  std::string name;
+  image::Image img;
+};
+
+// Decodes and preprocesses the pictures now, so a bad path is reported at once;
+// the vision tower runs when the message is sent.
+void attach(const Model& model, const std::vector<std::string>& paths, long long max_pixels,
+            std::vector<Attachment>& attached) {
+  if (!model.has_vision()) {
+    printf("%sthis checkpoint has no vision tower; it cannot take pictures%s\n", kDim, kReset);
+    return;
+  }
+  for (const std::string& raw : paths) {
+    const std::string p = expand_home(raw);
+    try {
+      image::Image im = image::preprocess(image::load(p), image::kMinPixels, max_pixels);
+      const std::string name = basename_of(p);
+      printf("%sattached %s: %dx%d", kDim, name.c_str(), im.w, im.h);
+      if (im.w != im.rw || im.h != im.rh) printf(" -> %dx%d", im.rw, im.rh);
+      printf(", %d tokens%s\n", im.n_tokens(), kReset);
+      attached.push_back(Attachment{name, im});
+    } catch (const std::exception& e) {
+      printf("%scannot attach %s: %s%s\n", kDim, p.c_str(), e.what(), kReset);
+    }
+  }
+}
+
 void generate(Session& s, const std::string& text, bool think, const Args& a,
-              float temp) {
+              float temp, const std::vector<image::Image>& images = {}) {
   ThinkStyler styler(think);
-  s.turn(text, think, temp, a.top_p, a.top_k, a.max_tokens,
-         [&](const std::string& piece) { styler.feed(piece); });
+  try {
+    s.turn(text, think, temp, a.top_p, a.top_k, a.max_tokens,
+           [&](const std::string& piece) { styler.feed(piece); }, images);
+  } catch (const std::exception& e) {
+    styler.finish();
+    printf("%s%s%s\n", kDim, e.what(), kReset);
+    return;
+  }
   styler.finish();
   printf("\n");
   if (take_interrupt()) printf("%s^C interrupted%s\n", kDim, kReset);
@@ -261,6 +361,7 @@ int main(int argc, char** argv) {
     opt.spec = !a.no_spec;
     opt.draft = a.draft;
     opt.dump_dir = a.dump_dir;
+    opt.max_pixels = a.max_pixels;
     serve(path, opt);
     return 0;  // unreachable: serve() exits
   }
@@ -272,16 +373,26 @@ int main(int argc, char** argv) {
   Session s(model, tk, a.system, !a.no_spec, a.draft);
   bool think = a.think;
   float temp = a.temp;
-  fprintf(stderr, "ready in %.1fs%s   /help for commands, /exit to quit\n\n",
+  fprintf(stderr, "ready in %.1fs%s%s   /help for commands, /exit to quit\n\n",
           std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
-          s.speculative() ? "" : "  (no MTP head: plain decoding)");
+          s.speculative() ? "" : "  (no MTP head: plain decoding)",
+          model.has_vision() ? "" : "  (no vision tower: text only)");
+
+  std::vector<Attachment> attached;  // for the next message
+  attach(model, a.images, a.max_pixels, attached);
+  auto take_attached = [&attached]() {
+    std::vector<image::Image> out;
+    for (Attachment& at : attached) out.push_back(at.img);
+    attached.clear();  // whatever happens, they went with this message
+    return out;
+  };
 
   install_interrupt_handler();
 
   // One-shot mode: generate once and exit. Useful for scripting and for diffing
   // against the Python implementation.
   if (!a.prompt.empty()) {
-    generate(s, a.prompt, think, a, temp);
+    generate(s, a.prompt, think, a, temp, take_attached());
     print_stats(s);
     return 0;
   }
@@ -339,6 +450,23 @@ int main(int argc, char** argv) {
         s.system = arg;
         printf("%ssystem prompt %s; takes effect on /new%s\n", kDim,
                arg.empty() ? "cleared" : "set", kReset);
+      } else if (cmd == "image") {
+        if (arg == "clear") {
+          attached.clear();
+          printf("%sattachments dropped%s\n", kDim, kReset);
+        } else if (!arg.empty()) {
+          try {
+            attach(model, split_paths(arg), a.max_pixels, attached);
+          } catch (const std::exception& e) {
+            printf("%scannot read the path: %s%s\n", kDim, e.what(), kReset);
+          }
+        } else if (!attached.empty()) {
+          std::string names;
+          for (const Attachment& at : attached) names += (names.empty() ? "" : ", ") + at.name;
+          printf("%sattached: %s%s\n", kDim, names.c_str(), kReset);
+        } else {
+          printf("%snothing attached; /image <path> to attach%s\n", kDim, kReset);
+        }
       } else if (cmd == "stats") {
         print_stats(s);
       } else if (cmd == "paste") {
@@ -351,7 +479,7 @@ int main(int argc, char** argv) {
       if (!send) continue;
     }
 
-    generate(s, text, think, a, temp);
+    generate(s, text, think, a, temp, take_attached());
   }
 
   fprintf(stderr, "%sconversation discarded%s\n", kDim, kReset);

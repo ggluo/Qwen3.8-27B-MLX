@@ -5,6 +5,7 @@
 // weights and are skipped if the directory is absent, so `make test` stays
 // useful without a 16 GB download.
 #include <sys/select.h>
+#include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <util.h>
@@ -16,9 +17,11 @@
 #include <cstring>
 #include <functional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "delta.hpp"
+#include "image.hpp"
 #include "lineread.hpp"
 #include "model.hpp"
 #include "serve.hpp"
@@ -750,19 +753,523 @@ void test_lineread(const char* self) {
   waitpid(pid, &status, 0);
 }
 
+
+// ---------------------------------------------------------------------------
+// images -- pinned to the Python port, which is pinned to transformers
+// ---------------------------------------------------------------------------
+
+struct ImageGolden {
+  const char* file;
+  long long max_pixels;
+  int gh, gw;
+  uint64_t hash;
+};
+
+#include "image_golden.inc"
+
+uint64_t fnv1a64(const void* data, size_t n) {
+  const unsigned char* p = static_cast<const unsigned char*>(data);
+  uint64_t h = 0xCBF29CE484222325ULL;
+  for (size_t i = 0; i < n; ++i) {
+    h ^= p[i];
+    h *= 0x100000001B3ULL;
+  }
+  return h;
+}
+
+std::string read_file(const std::string& path) {
+  FILE* f = fopen(path.c_str(), "rb");
+  if (!f) throw std::runtime_error("cannot open " + path);
+  std::string s;
+  char buf[1 << 16];
+  for (size_t n; (n = fread(buf, 1, sizeof(buf), f)) > 0;) s.append(buf, n);
+  fclose(f);
+  return s;
+}
+
+void test_image(const std::string& data) {
+  printf("\nimages (%s)\n", data.c_str());
+  using image::smart_resize;
+  check(smart_resize(480, 640) == std::make_pair(480, 640),
+        "smart_resize keeps an in-range multiple of 32");
+  {
+    const std::pair<int, int> r = smart_resize(3024, 4032);
+    check(r.first % 32 == 0 && r.second % 32 == 0 &&
+              static_cast<long long>(r.first) * r.second <= image::kMaxPixels,
+          "smart_resize shrinks a 12 MP photo to " + std::to_string(r.second) + "x" +
+              std::to_string(r.first) + ", <= kMaxPixels");
+    const std::pair<int, int> t = smart_resize(120, 200);
+    check(static_cast<long long>(t.first) * t.second >= image::kMinPixels,
+          "smart_resize grows a tiny image to >= kMinPixels");
+  }
+  // 80/32 = 2.5 and 112/32 = 3.5: half-to-even gives (64, 128), half-up (96, 128)
+  check(smart_resize(80, 112, 1, 1000000000LL) == std::make_pair(64, 128),
+        "rounding is half-to-even, as Python's round() in the reference is");
+  bool threw = false;
+  try {
+    smart_resize(10, 3000);
+  } catch (const std::exception&) {
+    threw = true;
+  }
+  check(threw, "an aspect ratio beyond 200:1 is refused");
+
+  check(image::base64_decode("aGVsbG8gd29ybGQ=") == "hello world" &&
+            image::base64_decode("aGVs\nbG8=") == "hello",
+        "base64 decodes, skipping whitespace");
+  threw = false;
+  try {
+    image::base64_decode("aGV$bG8=");
+  } catch (const std::exception&) {
+    threw = true;
+  }
+  check(threw, "base64 outside the alphabet is refused");
+
+  // Pixels identical to the Python port's, which match transformers' processor:
+  // decode, EXIF orientation, alpha, resize, normalisation and patch order at once.
+  for (const ImageGolden& g : kImageGolden) {
+    image::Image im = image::preprocess(image::load(data + "/" + g.file), image::kMinPixels,
+                                        g.max_pixels);
+    mx::array px = mx::astype(im.pixels, mx::float32);
+    mx::eval(px);
+    const uint64_t h = fnv1a64(px.data<float>(), px.nbytes());
+    char buf[200];
+    snprintf(buf, sizeof(buf), "%-16s max %8lld: grid %dx%d, patches bit-identical to Python",
+             g.file, g.max_pixels, im.gh, im.gw);
+    check(im.gh == g.gh && im.gw == g.gw && h == g.hash, buf);
+  }
+
+  // The EXIF-6 JPEG is stored sideways; once righted it must look like the
+  // upright PNG it was made from (JPEG noise aside), not like a rotation of it.
+  {
+    image::RGB a = image::load(data + "/arrow_exif6.jpg");
+    image::RGB b = image::load(data + "/arrow_upright.png");
+    double diff = 0;
+    if (a.w == b.w && a.h == b.h) {
+      for (size_t i = 0; i < a.px.size(); ++i) diff += std::abs(a.px[i] - b.px[i]);
+      diff /= static_cast<double>(a.px.size());
+    }
+    char buf[160];
+    snprintf(buf, sizeof(buf), "EXIF orientation 6 righted: %dx%d, mean |diff| %.2f vs upright",
+             a.w, a.h, diff);
+    check(a.w == b.w && a.h == b.h && diff < 2.0, buf);
+  }
+
+  // positions and placeholders
+  std::vector<int> t, hh, ww;
+  image::positions(10, 2, 3, t, hh, ww);
+  check(t == std::vector<int>(6, 10) && hh == std::vector<int>{10, 10, 10, 11, 11, 11} &&
+            ww == std::vector<int>{10, 11, 12, 10, 11, 12},
+        "image positions: shared t, rows on h, cols on w");
+  check(delta_contribution(ImageSpan{0, 3, 5}) == 5 - 15,
+        "a 3x5 image advances positions by 5, not 15");
+  const int pad = 248056;
+  check(expand_image_pads({1, pad, 2, pad, 3}, {2, 3}, pad) ==
+            std::vector<int>{1, pad, pad, 2, pad, pad, pad, 3},
+        "one <|image_pad|> expands into one per token");
+  const std::vector<ImageSpan> sp = find_image_spans({pad, pad, pad, pad, pad}, {{1, 2}, {1, 3}}, pad, 100);
+  check(sp.size() == 2 && sp[0].start == 100 && sp[1].start == 102 && sp[1].n() == 3,
+        "adjacent images in one pad run are split by their grids");
+  std::string axes;
+  for (int a : mrope_axes(64, {11, 11, 10})) axes += "THW"[a];
+  check(axes == "THWTHWTHWTHWTHWTHWTHWTHWTHWTHWTH", "M-RoPE frequencies interleave THW...TH");
+}
+
+// ---------------------------------------------------------------------------
+// the model looking at pictures
+// ---------------------------------------------------------------------------
+
+std::string lower_copy(std::string s) {
+  for (char& c : s) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+  return s;
+}
+
+void test_vision_model(const std::string& path, const std::string& data) {
+  printf("\nvision (%s)\n", path.c_str());
+  Model m = load_model(path, /*verbose=*/false);
+  if (!m.has_vision()) {
+    printf("  [skip] checkpoint has no vision tower\n");
+    return;
+  }
+  Tokenizer tk(path + "/tokenizer.json");
+  auto img = [&](const char* f) { return image::preprocess(image::load(data + "/" + f)); };
+  auto ask = [&](Session& s, const std::vector<image::Image>& ims, const std::string& q, int n) {
+    std::string out;
+    s.turn(q, false, 0.0f, 0.95f, 20, n, [&](const std::string& p) { out += p; }, ims);
+    return out;
+  };
+  {
+    Session s(m, tk, "", true, 3);
+    const std::string a =
+        ask(s, {img("shapes.png")}, "What number is written in the image? The number only.", 16);
+    check(a.find("42") != std::string::npos, "reads the number: \"" + brief(a) + "\"");
+  }
+  {
+    Session s(m, tk, "", true, 3);
+    const std::string a = ask(s, {img("arrow_exif6.jpg")},
+                              "Which way does the arrow point: up, down, left or right? One word.", 8);
+    check(lower_copy(a).rfind("up", 0) == 0,
+          "EXIF orientation applied: the arrow points \"" + brief(a) + "\"");
+  }
+  {
+    Session s(m, tk, "", true, 3);
+    const std::string a = ask(s, {img("alpha_text.png")}, "What word is written? The word only.", 8);
+    check(lower_copy(a).find("cat") != std::string::npos,
+          "black text on a transparent background is legible: \"" + brief(a) + "\"");
+  }
+  {
+    // A follow-up with no picture, then a second picture: the rope delta must
+    // carry across turns and accumulate across images.
+    Session s(m, tk, "", true, 3);
+    ask(s, {img("shapes.png")}, "What colour is the square? One word.", 8);
+    const std::string a2 = ask(s, {}, "And the circle? One word.", 8);
+    ask(s, {img("arrow_exif6.jpg")}, "Which way does this arrow point? One word.", 8);
+    const std::string a4 = ask(s, {}, "In the FIRST picture, what number was written? Number only.", 8);
+    check(lower_copy(a2).find("blue") != std::string::npos && a4.find("42") != std::string::npos,
+          "multi-turn: follow-up \"" + brief(a2) + "\", recall across images \"" + brief(a4) +
+              "\" (rope delta " + std::to_string(s.rope_delta()) + ")");
+  }
+  {
+    // Speculative decoding must not drift from plain with a picture in context:
+    // the draft and the verify pass both take the shifted positions. A wrong
+    // shift diverges at once, on a clearly-decided token. What is allowed is the
+    // bf16 caveat speculative decoding always has -- the verify pass scores at
+    // L=k+1 and plain decode at L=1, and on an EXACT tie the argmax can differ --
+    // so a divergence passes only if the plain model's top two there are within
+    // bf16 resolution of each other.
+    const image::Image im = img("shapes.png");
+    const std::string q = "List the shapes and their colours.";
+    Session p(m, tk, "", false, 3), sp(m, tk, "", true, 3);
+    const std::string a = ask(p, {im}, q, 40);
+    const std::string b = ask(sp, {im}, q, 40);
+    const std::vector<int>& ta = p.tokens();
+    const std::vector<int>& tb = sp.tokens();
+    size_t i = 0;
+    while (i < ta.size() && i < tb.size() && ta[i] == tb[i]) ++i;
+    if (a == b) {
+      check(!a.empty(), "speculative == plain at temp 0, image in context");
+    } else {
+      // replay the plain path to the divergence and read its logits there
+      const size_t n0 = static_cast<size_t>(p.last().prompt_n);
+      std::vector<LayerCache> cache = m.make_cache();
+      std::pair<mx::array, int> r =
+          prefill(m, cache, std::vector<int>(ta.begin(), ta.begin() + static_cast<long>(n0)),
+                  {ImageFeatures{m.embed_image(im), im.rows(), im.cols()}}, 0, 384);
+      mx::array h = r.first;
+      for (size_t k = n0; k < i; ++k) {
+        mx::array tok({ta[k]}, mx::Shape{1, 1}, mx::int32);
+        h = m.hidden_states(tok, cache, Rope::at(cache[0].offset() + r.second));
+      }
+      mx::array lg = mx::astype(ops::index_axis(ops::index_axis(m.logits(h), 1, 0), 0, 0), mx::float32);
+      mx::array top = mx::topk(lg, 2);  // ascending: [second, first]
+      mx::eval(top);
+      const float gap = top.data<float>()[1] - top.data<float>()[0];
+      char buf[200];
+      snprintf(buf, sizeof(buf),
+               "speculative vs plain, image in context: diverge at reply token %zu on a bf16 "
+               "tie (top-2 gap %.4f)",
+               i - n0, gap);
+      check(i > n0 && gap <= 0.25f, buf);
+    }
+  }
+  {
+    Session s(m, tk, "", true, 3);
+    bool refused = false;
+    try {
+      ask(s, {}, "a literal <|image_pad|> in the text", 4);
+    } catch (const std::exception&) {
+      refused = true;
+    }
+    check(refused && s.context_tokens() == 0,
+          "a literal <|image_pad|> is refused, leaving the conversation untouched");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// serve mode with pictures -- over a socketpair, since a test may not bind a port
+// ---------------------------------------------------------------------------
+
+std::string base64_encode(const std::string& in) {
+  static const char* abc = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::string out;
+  size_t i = 0;
+  for (; i + 2 < in.size(); i += 3) {
+    const uint32_t v = (static_cast<unsigned char>(in[i]) << 16) |
+                       (static_cast<unsigned char>(in[i + 1]) << 8) |
+                       static_cast<unsigned char>(in[i + 2]);
+    out += abc[(v >> 18) & 63];
+    out += abc[(v >> 12) & 63];
+    out += abc[(v >> 6) & 63];
+    out += abc[v & 63];
+  }
+  if (i < in.size()) {
+    uint32_t v = static_cast<unsigned char>(in[i]) << 16;
+    if (i + 1 < in.size()) v |= static_cast<unsigned char>(in[i + 1]) << 8;
+    out += abc[(v >> 18) & 63];
+    out += abc[(v >> 12) & 63];
+    out += i + 1 < in.size() ? abc[(v >> 6) & 63] : '=';
+    out += '=';
+  }
+  return out;
+}
+
+struct Reply {
+  int status = 0;
+  std::string body;
+};
+
+// One request/response on a keep-alive socket.
+Reply http_post(int fd, const std::string& body) {
+  const std::string req = "POST /v1/chat/completions HTTP/1.1\r\nHost: test\r\n"
+                          "Content-Type: application/json\r\nContent-Length: " +
+                          std::to_string(body.size()) + "\r\n\r\n" + body;
+  for (size_t off = 0; off < req.size();) {
+    const ssize_t w = ::write(fd, req.data() + off, req.size() - off);
+    if (w <= 0) return Reply{};
+    off += static_cast<size_t>(w);
+  }
+  std::string buf;
+  char tmp[16384];
+  auto more = [&]() {
+    const ssize_t n = ::read(fd, tmp, sizeof(tmp));
+    if (n <= 0) return false;
+    buf.append(tmp, static_cast<size_t>(n));
+    return true;
+  };
+  size_t head_end;
+  while ((head_end = buf.find("\r\n\r\n")) == std::string::npos) {
+    if (!more()) return Reply{};
+  }
+  Reply r;
+  r.status = atoi(buf.c_str() + 9);  // "HTTP/1.1 200"
+  const std::string head = lower_copy(buf.substr(0, head_end));
+  const size_t cl = head.find("content-length:");
+  if (cl != std::string::npos) {
+    const size_t n = static_cast<size_t>(atol(head.c_str() + cl + 15));
+    while (buf.size() < head_end + 4 + n) {
+      if (!more()) break;
+    }
+    r.body = buf.substr(head_end + 4, n);
+  } else {  // chunked: read to the terminating chunk
+    while (buf.find("\r\n0\r\n\r\n", head_end) == std::string::npos) {
+      if (!more()) break;
+    }
+    r.body = buf.substr(head_end + 4);
+  }
+  return r;
+}
+
+std::string image_part(const std::string& bytes, const char* mime = "image/png") {
+  return "{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:" + std::string(mime) +
+         ";base64," + base64_encode(bytes) + "\"}}";
+}
+
+std::string text_part(const std::string& t) {
+  json::Value v;
+  v.type = json::Type::Str;
+  v.str = t;
+  return "{\"type\":\"text\",\"text\":" + json::dump(v) + "}";
+}
+
+std::string msg(const std::string& role, const std::string& content_json) {
+  return "{\"role\":\"" + role + "\",\"content\":" + content_json + "}";
+}
+
+std::string jtext(const std::string& t) {
+  json::Value v;
+  v.type = json::Type::Str;
+  v.str = t;
+  return json::dump(v);
+}
+
+std::string chat_body(const std::vector<std::string>& msgs, int max_tokens, bool stream = false) {
+  std::string m;
+  for (size_t i = 0; i < msgs.size(); ++i) m += (i ? "," : "") + msgs[i];
+  return "{\"model\":\"test\",\"temperature\":0,\"max_tokens\":" + std::to_string(max_tokens) +
+         ",\"stream\":" + (stream ? "true" : "false") + ",\"messages\":[" + m + "]}";
+}
+
+void test_serve_parse() {
+  printf("\nserve: image content parts\n");
+  auto parse = [](const std::string& content, std::vector<std::string>& imgs) {
+    return flatten_content(json::parse(content), imgs);
+  };
+  std::vector<std::string> imgs;
+  const std::string t = parse("[{\"type\":\"text\",\"text\":\"a\"},"
+                              "{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,aGk=\"}},"
+                              "{\"type\":\"text\",\"text\":\"b\"},"
+                              "{\"type\":\"image_url\",\"image_url\":\"data:image/jpeg;base64,eW8=\"},"
+                              "{\"type\":\"image\",\"image\":\"data:image/png;base64,Pz8=\"}]",
+                              imgs);
+  check(t == std::string("a") + kImagePlaceholder + "b" + kImagePlaceholder + kImagePlaceholder &&
+            imgs == std::vector<std::string>{"hi", "yo", "??"},
+        "parts in order: text and placeholders interleave, bytes decoded (object, string and "
+        "`image` forms)");
+  auto refused = [&](const std::string& url, const char* want) {
+    std::vector<std::string> im;
+    try {
+      parse("[{\"type\":\"image_url\",\"image_url\":{\"url\":\"" + url + "\"}}]", im);
+    } catch (const std::exception& e) {
+      return std::string(e.what()).find(want) != std::string::npos;
+    }
+    return false;
+  };
+  check(refused("https://example.com/cat.png", "never touches the network"),
+        "an https image URL is refused: no network");
+  check(refused("file:///etc/passwd", "disk"), "a file: image URL is refused: would read the disk");
+  check(refused("data:image/png,rawbytes", "base64"), "a non-base64 data: URL is refused");
+}
+
+void test_serve_vision(const std::string& path, const std::string& data) {
+  printf("\nserve: pictures over the real HTTP path (%s)\n", path.c_str());
+  int sv[2];
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+    printf("  [skip] socketpair failed\n");
+    return;
+  }
+  const int one = 1;
+  setsockopt(sv[0], SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+  struct timeval tv {600, 0};
+  setsockopt(sv[0], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  ServeOptions opt;
+  opt.model_name = "test";
+  std::thread server([&] { serve_socket(path, opt, sv[1]); });
+
+  auto content_of = [](const Reply& r) {
+    try {
+      return json::parse(r.body)["choices"][0]["message"]["content"].as_str();
+    } catch (const std::exception&) {
+      return std::string();
+    }
+  };
+  auto prompt_tokens = [](const Reply& r) {
+    try {
+      return static_cast<int>(json::parse(r.body)["usage"]["prompt_tokens"].as_int(-1));
+    } catch (const std::exception&) {
+      return -1;
+    }
+  };
+  auto error_of = [](const Reply& r) {
+    try {
+      return json::parse(r.body)["error"]["message"].as_str();
+    } catch (const std::exception&) {
+      return std::string();
+    }
+  };
+
+  const std::string shapes = read_file(data + "/shapes.png");
+  const std::string alpha = read_file(data + "/alpha_text.png");
+  const std::string q = "What is written in the image? Answer with exactly what is written.";
+  const std::string u1 = msg("user", "[" + image_part(shapes) + "," + text_part(q) + "]");
+
+  // 1. a picture, cold
+  const Reply r1 = http_post(sv[0], chat_body({u1}, 12));
+  const std::string c1 = content_of(r1);
+  const int p1 = prompt_tokens(r1);
+  check(r1.status == 200 && c1.find("42") != std::string::npos && p1 > 300,
+        "picture in, cold: \"" + brief(c1) + "\", " + std::to_string(p1) + " prompt tokens");
+
+  // 2. the client echoes the history and asks more: the picture is already in the
+  //    context, so only the new turn is fed
+  const std::string a1 = msg("assistant", jtext(c1));
+  const std::string u2 = msg("user", jtext("What colour is the circle? One word."));
+  const Reply r2 = http_post(sv[0], chat_body({u1, a1, u2}, 8));
+  const std::string c2 = content_of(r2);
+  const int p2 = prompt_tokens(r2);
+  check(r2.status == 200 && lower_copy(c2).find("blue") != std::string::npos && p2 > 0 && p2 < 60,
+        "echoed history continues: \"" + brief(c2) + "\", only " + std::to_string(p2) +
+            " new prompt tokens");
+
+  // 3. the same words about a DIFFERENT picture is a different conversation: it
+  //    must not be appended to the cached one
+  const std::string u1b = msg("user", "[" + image_part(alpha) + "," + text_part(q) + "]");
+  const std::string a2 = msg("assistant", jtext(c2));
+  const std::string u3 = msg("user", jtext("Say OK."));
+  const Reply r3 = http_post(sv[0], chat_body({u1b, a1, u2, a2, u3}, 8));
+  const int p3 = prompt_tokens(r3);
+  check(r3.status == 200 && p3 > 72,
+        "a swapped picture starts over: " + std::to_string(p3) + " prompt tokens, not a tail");
+
+  // 4. refusals, each a 400 that leaves the cached conversation alone
+  struct Bad {
+    const char* what;
+    std::string body;
+    const char* want;
+  };
+  const std::vector<Bad> bads = {
+      {"https URL",
+       chat_body({msg("user", "[{\"type\":\"image_url\",\"image_url\":{\"url\":\"https://x/y.png\"}}]")}, 4),
+       "network"},
+      {"file: URL",
+       chat_body({msg("user", "[{\"type\":\"image_url\",\"image_url\":{\"url\":\"file:///etc/hosts\"}}]")}, 4),
+       "disk"},
+      {"bytes that are not a picture",
+       chat_body({msg("user", "[" + image_part("hello, not an image") + "," + text_part("?") + "]")}, 4),
+       "image 1"},
+      {"a picture in a system message",
+       chat_body({msg("system", "[" + image_part(shapes) + "]"), msg("user", jtext("hi"))}, 4),
+       "only user messages"},
+  };
+  for (const Bad& b : bads) {
+    const Reply r = http_post(sv[0], b.body);
+    const std::string e = error_of(r);
+    check(r.status == 400 && e.find(b.want) != std::string::npos,
+          std::string("refused with 400: ") + b.what + " (\"" + brief(e, 60) + "\")");
+  }
+
+  // 5. ... and after them the conversation still continues from where it was
+  const std::string c3 = content_of(r3);
+  const Reply r5 = http_post(sv[0], chat_body({u1b, a1, u2, a2, u3, msg("assistant", jtext(c3)),
+                                               msg("user", jtext("Say OK again."))},
+                                              8));
+  const int p5 = prompt_tokens(r5);
+  check(r5.status == 200 && p5 > 0 && p5 < 40,
+        "after the refusals the cached conversation continues: " + std::to_string(p5) +
+            " new prompt tokens");
+
+  // 6. streaming, with a picture
+  const Reply r6 = http_post(
+      sv[0], chat_body({msg("user", "[" + image_part(shapes) + "," +
+                                        text_part("What number is written? Number only.") + "]")},
+                       8, /*stream=*/true));
+  // Digits are tokenized one at a time, so "42" arrives as two deltas: put the
+  // stream back together before looking for it.
+  std::string streamed;
+  for (size_t at = r6.body.find("data: {"); at != std::string::npos;
+       at = r6.body.find("data: {", at + 1)) {
+    const size_t end = r6.body.find("\n\n", at);
+    try {
+      streamed += json::parse(r6.body.substr(at + 6, end - at - 6))["choices"][0]["delta"]["content"]
+                      .as_str();
+    } catch (const std::exception&) {
+    }
+  }
+  check(r6.status == 200 && streamed.find("42") != std::string::npos &&
+            r6.body.find("[DONE]") != std::string::npos,
+        "a streamed reply about a picture: \"" + brief(streamed) + "\"");
+
+  close(sv[0]);  // the server sees EOF, closes its end and returns
+  server.join();
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   std::string model = "../qwen3.5-27b-4bit-uncensored";
   std::string tok_json;
   bool want_model = true;
+  // the shared test pictures live at the repository root, next to cpp/
+  std::string data = std::string(argv[0]).rfind('/') == std::string::npos
+                         ? "../testdata"
+                         : std::string(argv[0]).substr(0, std::string(argv[0]).rfind('/')) +
+                               "/../../testdata";
   for (int i = 1; i < argc; ++i) {
     if (!strcmp(argv[i], "--lineread-child")) return lineread_child();
     if (!strcmp(argv[i], "--model") && i + 1 < argc) model = argv[++i];
     else if (!strcmp(argv[i], "--tokenizer") && i + 1 < argc) tok_json = argv[++i];
     else if (!strcmp(argv[i], "--no-model")) want_model = false;
+    else if (!strcmp(argv[i], "--data") && i + 1 < argc) data = argv[++i];
     else {
-      printf("usage: tests [--model DIR] [--tokenizer FILE] [--no-model]\n");
+      printf("usage: tests [--model DIR] [--tokenizer FILE] [--data DIR] [--no-model]\n");
       return 1;
     }
   }
@@ -781,12 +1288,27 @@ int main(int argc, char** argv) {
   test_http();
   test_stop_filter();
   test_lineread(argv[0]);
+  test_serve_parse();
+  try {
+    test_image(data);
+  } catch (const std::exception& e) {
+    printf("  [skip] image tests: %s\n", e.what());
+  }
   if (want_model) {
     try {
       test_model(model);
     } catch (const std::exception& e) {
       printf("  [skip] model tests: %s\n", e.what());
     }
+    mx::clear_cache();
+    try {
+      test_vision_model(model, data);
+    } catch (const std::exception& e) {
+      printf("  [skip] vision tests: %s\n", e.what());
+    }
+    mx::clear_cache();
+    // last: its model thread holds the model for the rest of the process
+    test_serve_vision(model, data);
   }
 
   printf("\n%d passed, %d failed\n", g_pass, g_fail);

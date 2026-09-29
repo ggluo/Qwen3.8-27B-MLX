@@ -575,6 +575,59 @@ ToolCallParser::Piece ToolCallParser::finish() {
 // the request
 // ---------------------------------------------------------------------------
 
+namespace {
+
+// The bytes of one picture, from the URL a client gave for it.
+std::string image_bytes(const std::string& url) {
+  if (url.rfind("data:", 0) == 0) {
+    const size_t comma = url.find(',');
+    if (comma == std::string::npos) throw std::runtime_error("malformed data: URL for an image");
+    const std::string meta = url.substr(5, comma - 5);  // e.g. "image/png;base64"
+    if (meta.size() < 7 || meta.compare(meta.size() - 7, 7, ";base64") != 0) {
+      throw std::runtime_error("image data: URLs must be base64 (data:<type>;base64,...)");
+    }
+    std::string bytes = image::base64_decode(url.substr(comma + 1));
+    if (bytes.empty()) throw std::runtime_error("empty image in data: URL");
+    return bytes;
+  }
+  if (url.rfind("http://", 0) == 0 || url.rfind("https://", 0) == 0) {
+    throw std::runtime_error("image URLs are not fetched -- this server never touches the "
+                             "network; send the picture inline as a data:<type>;base64,... URL");
+  }
+  if (url.rfind("file:", 0) == 0) {
+    throw std::runtime_error("file: image URLs are refused: they would let any client read "
+                             "pictures off the server's disk; send the bytes as a data: URL");
+  }
+  throw std::runtime_error("unsupported image URL; send the picture as a data:<type>;base64,... URL");
+}
+
+}  // namespace
+
+std::string flatten_content(const json::Value& content, std::vector<std::string>& images) {
+  if (content.type == json::Type::Str) return content.str;
+  if (content.is_null()) return "";
+  if (!content.is_arr()) {
+    throw std::runtime_error("message content must be a string or an array of parts");
+  }
+  std::string text;
+  for (const json::Value& part : content.arr) {
+    const std::string type = part["type"].as_str();
+    if (type == "text" || type == "input_text") {
+      text += part["text"].as_str();
+    } else if (type == "image_url" || type == "input_image" || type == "image") {
+      // {"image_url": {"url": ...}} is the API's shape; a bare string there, and
+      // {"type": "image", "image": ...}, are what other clients send.
+      const json::Value& iu = part["image_url"];
+      std::string url = iu.is_obj() ? iu["url"].as_str() : iu.as_str();
+      if (url.empty()) url = part["image"].as_str();
+      if (url.empty()) throw std::runtime_error("an image part has no url");
+      images.push_back(image_bytes(url));
+      text += kImagePlaceholder;
+    }
+  }
+  return text;
+}
+
 std::string HttpRequest::header(const std::string& name) const {
   const std::string want = lower(name);
   for (const auto& h : headers) {
@@ -685,26 +738,6 @@ struct ChatRequest {
   unsigned dump_no = 0;  // --dump's file number for this request, 0 for none
 };
 
-// A message's `content`: a plain string, or the array of parts the API allows.
-// Only text parts carry anything for a text-only model.
-std::string flatten_content(const json::Value& content) {
-  if (content.type == json::Type::Str) return content.str;
-  if (content.is_null()) return "";
-  if (!content.is_arr()) {
-    throw std::runtime_error("message content must be a string or an array of parts");
-  }
-  std::string text;
-  for (const json::Value& part : content.arr) {
-    const std::string type = part["type"].as_str();
-    if (type == "text") {
-      text += part["text"].as_str();
-    } else if (type == "image_url" || type == "input_image") {
-      throw std::runtime_error("this build is text-only: image content is not supported");
-    }
-  }
-  return text;
-}
-
 // The template knows four roles. `developer` is the API's newer name for the
 // system prompt and lands in the same block.
 std::string render_role(const std::string& role) {
@@ -784,7 +817,14 @@ std::string dump_breakdown(const ChatRequest& cr, size_t from, size_t reused) {
   for (size_t i = from; i < cr.msgs.size(); ++i) {
     if (i > from) out += ',';
     out += "{\"role\":" + quoted(cr.msgs[i].role) +
-           ",\"content_bytes\":" + std::to_string(cr.msgs[i].content.size()) + "}";
+           ",\"content_bytes\":" + std::to_string(cr.msgs[i].content.size());
+    if (!cr.msgs[i].images.empty()) {
+      size_t img_bytes = 0;
+      for (const std::string& b : cr.msgs[i].images) img_bytes += b.size();
+      out += ",\"images\":" + std::to_string(cr.msgs[i].images.size()) +
+             ",\"image_bytes\":" + std::to_string(img_bytes);
+    }
+    out += "}";
   }
   return out + "]}";
 }
@@ -819,7 +859,12 @@ ChatRequest parse_chat(const json::Value& body, const ServeOptions& opt) {
   for (const json::Value& m : messages.arr) {
     Message msg;
     msg.role = render_role(m["role"].as_str());
-    msg.content = flatten_content(m["content"]);
+    msg.content = flatten_content(m["content"], msg.images);
+    if (!msg.images.empty() && msg.role != "user") {
+      // the template raises on a picture anywhere but a user turn
+      throw std::runtime_error("only user messages can contain images, not " + msg.role +
+                               " messages");
+    }
     msg.reasoning = m["reasoning_content"].as_str();
     msg.tool_calls = parse_tool_calls(m["tool_calls"]);
     // The template has one system block, at the head, so the system messages are
@@ -881,11 +926,13 @@ ChatRequest parse_chat(const json::Value& body, const ServeOptions& opt) {
 
 // The conversation. Everything here is touched only by the model thread.
 struct Server {
-  Server(const Model& model, const Tokenizer& tk, const ServeOptions& options)
+  Server(const Model& m, const Tokenizer& tk, const ServeOptions& options)
       : opt(options),
-        session(model, tk, /*system=*/std::string(), opt.spec, opt.draft) {}
+        model(m),
+        session(m, tk, /*system=*/std::string(), opt.spec, opt.draft) {}
 
   const ServeOptions& opt;
+  const Model& model;
 
   Session session;
   std::vector<Message> held;      // the messages the session's context already covers
@@ -1041,16 +1088,10 @@ bool Server::handle(const ChatRequest& cr, int fd) {
       held_ok && same_head && cr.msgs.size() > held.size() &&
       std::equal(held.begin(), held.end(), cr.msgs.begin(),
                  [](const Message& a, const Message& b) {
-                   return a.role == b.role && a.content == b.content;
+                   // the pictures too: the same words about a different picture
+                   // are a different conversation
+                   return a.role == b.role && a.content == b.content && a.images == b.images;
                  });
-  if (!append) {
-    session.reset();
-    held.clear();
-    held_ok = false;
-  }
-  // What the session held before this turn: the difference between this and the
-  // prompt below is what the KV cache reuse bought.
-  const size_t reused = session.context_tokens();
   const size_t from = append ? held.size() : 0;
 
   const std::string prompt = append ? render_tail(cr.msgs, held.size(), cr.think)
@@ -1060,6 +1101,54 @@ bool Server::handle(const ChatRequest& cr, int fd) {
   // system prompt and tools included; a continued one is the tail, and it is
   // named as a tail so that nobody reads half a conversation as a whole prompt.
   dump_text(opt.dump_dir, cr.dump_no, from > 0 ? "prompt-tail.txt" : "prompt.txt", prompt);
+
+  // The pictures this prompt carries: only those in the messages being fed now,
+  // since the earlier ones are already in the context. Decoded here, before
+  // anything is sent, so a bad picture is a plain 400 rather than a stream that
+  // breaks off -- and here rather than on the connection thread, because the
+  // preprocessing builds MLX arrays and must run on the model's thread.
+  std::vector<image::Image> pictures;
+  {
+    size_t n = 0;
+    for (size_t i = from; i < cr.msgs.size(); ++i) n += cr.msgs[i].images.size();
+    size_t pads = 0;
+    for (size_t at = prompt.find("<|image_pad|>"); at != std::string::npos;
+         at = prompt.find("<|image_pad|>", at + 1)) {
+      ++pads;
+    }
+    std::string bad;
+    if (n > 0 && !model.has_vision()) {
+      bad = "this model has no vision tower; it cannot take images";
+    } else if (pads != n) {
+      bad = "the messages contain a literal <|image_pad|> token";
+    }
+    for (size_t i = from; i < cr.msgs.size() && bad.empty(); ++i) {
+      for (size_t k = 0; k < cr.msgs[i].images.size() && bad.empty(); ++k) {
+        try {
+          pictures.push_back(image::preprocess(image::decode(cr.msgs[i].images[k]),
+                                               image::kMinPixels, opt.max_pixels));
+        } catch (const std::exception& e) {
+          bad = "image " + std::to_string(pictures.size() + 1) + ": " + e.what();
+        }
+      }
+    }
+    if (!bad.empty()) {
+      // Refused before the session is touched -- including the reset below -- so
+      // it still holds exactly `held`, and the next good request continues it.
+      dump_text(opt.dump_dir, cr.dump_no, "response.json", "{\"error\":" + quoted(bad) + "}");
+      fprintf(stderr, "  refused: %s\n", bad.c_str());
+      return send_error(fd, 400, bad);
+    }
+  }
+
+  if (!append) {
+    session.reset();
+    held.clear();
+    held_ok = false;
+  }
+  // What the session held before this turn: the difference between this and the
+  // prompt is what the KV cache reuse bought.
+  const size_t reused = session.context_tokens();
 
   // A streaming reply opens with the assistant role, the way the API does; some
   // clients will not accept a first delta that is only content.
@@ -1129,7 +1218,7 @@ bool Server::handle(const ChatRequest& cr, int fd) {
   });
 
   session.turn_prompt(prompt, cr.temp, cr.top_p, cr.top_k, cr.max_tokens,
-                      [&](const std::string& piece) { splitter.feed(piece); });
+                      [&](const std::string& piece) { splitter.feed(piece); }, pictures);
   splitter.finish();
   emit(false, stops.finish());
   // A reply that stopped mid-character gets the replacement character for a
@@ -1188,11 +1277,16 @@ bool Server::handle(const ChatRequest& cr, int fd) {
   const double dt =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   const double decode_t = st.dt > 0 ? st.dt : 1e-9;
+  char pics[64] = "";
+  if (st.images) {
+    snprintf(pics, sizeof(pics), " [%d picture%s, %.1fs vision]", st.images,
+             st.images == 1 ? "" : "s", st.vision_t);
+  }
   fprintf(stderr, "  %s %d in + %d out in %.1fs (prefill %.1fs %.0f tok/s,"
-                  " decode %.1fs %.1f tok/s)%s%s\n",
+                  " decode %.1fs %.1f tok/s)%s%s%s\n",
           append ? "continued" : "prefilled", st.prompt_n, st.n, dt, st.prefill_t,
           st.prompt_n / (st.prefill_t > 0 ? st.prefill_t : 1e-9), decode_t,
-          st.n / decode_t, cr.think ? " [think]" : "",
+          st.n / decode_t, pics, cr.think ? " [think]" : "",
           stops.hit() ? " [stop sequence]"
                       : (calls.empty() ? "" : " [called a tool]"));
 
@@ -1323,8 +1417,31 @@ void handle_connection(ModelThread& model, int fd) {
 
 }  // namespace
 
+void serve_socket(const std::string& model_dir, const ServeOptions& opt, int fd) {
+  // One model thread for the life of the process, as serve() has. It is never
+  // freed, for the same reason serve()'s is never joined.
+  static ModelThread* model = nullptr;
+  static std::string loaded;
+  if (!model) {
+    model = new ModelThread(model_dir, opt);
+    loaded = model_dir;
+  } else if (loaded != model_dir) {
+    throw std::runtime_error("serve_socket: already serving " + loaded);
+  }
+  model->wait_ready();
+  handle_connection(*model, fd);
+}
+
 void serve(const std::string& model_dir, const ServeOptions& opt) {
-  const int lfd = listen_socket(opt.host, opt.port);
+  int lfd = -1;
+  try {
+    lfd = listen_socket(opt.host, opt.port);
+  } catch (const std::exception& e) {
+    // A port in use, or one we may not bind, is the user's to fix, not a crash.
+    fprintf(stderr, "cannot serve: %s\n", e.what());
+    fflush(nullptr);
+    _exit(1);
+  }
   const int port = bound_port(lfd);
 
   // Replace the REPL's handler: SIGINT here stops the server, not one reply.

@@ -90,15 +90,22 @@ MLX_METALLIB := $(wildcard $(MLX_LIB)/mlx.metallib)
 CXX ?= clang++
 # MLX's headers go in with -isystem: bf16.h trips -Wdeprecated-copy once per
 # translation unit, and it is not our code to fix.
+#
+# -ffp-contract=off: clang may otherwise fuse a*b + c into one FMA, which rounds
+# once where Python rounds twice. The image resize weights are computed in double
+# precision on both sides and must agree to the last bit, or a pixel near a
+# rounding boundary lands on a different level and the two ports diverge.
 CXXFLAGS += -std=c++17 -O2 -Wall -Wextra -Wno-unused-parameter -MMD -MP \
-            -I src -isystem $(MLX_INCLUDE)
+            -ffp-contract=off -I src -isystem $(MLX_INCLUDE)
 
 # Where the binary looks for libmlx.dylib at runtime. `make bundle` overrides it.
 RPATH ?= $(MLX_LIB)
 
-# CoreFoundation is ours (Unicode NFC); libmlx pulls in Metal and Accelerate
-# itself, so they do not need repeating here.
-LDFLAGS += -L $(MLX_LIB) -lmlx -Wl,-rpath,$(RPATH) -framework CoreFoundation
+# CoreFoundation is ours (Unicode NFC), as are ImageIO and CoreGraphics (decoding
+# pictures); libmlx pulls in Metal and Accelerate itself, so they do not need
+# repeating here.
+LDFLAGS += -L $(MLX_LIB) -lmlx -Wl,-rpath,$(RPATH) -framework CoreFoundation \
+           -framework ImageIO -framework CoreGraphics
 
 # Everything except the two entry points is shared between the binaries.
 COMMON := $(filter-out src/main.cpp src/tests.cpp,$(wildcard src/*.cpp))

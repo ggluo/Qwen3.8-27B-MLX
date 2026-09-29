@@ -4,6 +4,7 @@ Text generation for the from-scratch Qwen3.5-27B.
     python generate.py --raw "The capital of France is" --temp 0 -n 20
     python generate.py "Explain what a KV cache is." -n 400
     python generate.py "Hi" --no-think -n 200
+    python generate.py "What is in this picture?" --image photo.jpg --no-think
 """
 
 import argparse
@@ -12,16 +13,19 @@ import time
 import mlx.core as mx
 
 import qwen35
+import vision
 from tokenizer import Tokenizer
 
 EOS = (248046, 248044)  # <|im_end|>, <|endoftext|>
 
 
-def chat_prompt(user: str, system: str = None, think: bool = True) -> str:
+def chat_prompt(user: str, system: str = None, think: bool = True,
+                n_images: int = 0) -> str:
     p = ""
     if system:
         p += f"<|im_start|>system\n{system}<|im_end|>\n"
-    p += f"<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n"
+    pics = "<|vision_start|><|image_pad|><|vision_end|>" * n_images
+    p += f"<|im_start|>user\n{pics}{user}<|im_end|>\n<|im_start|>assistant\n"
     # the template opens a reasoning block; closing it immediately disables thinking
     p += "<think>\n" if think else "<think>\n\n</think>\n\n"
     return p
@@ -49,9 +53,11 @@ def sample(logits: mx.array, temp: float, top_p: float, top_k: int) -> mx.array:
 
 
 def generate(model, tk, prompt: str, max_tokens=200, temp=1.0, top_p=0.95,
-             top_k=20, stream=True, prefill_step=384):
+             top_k=20, stream=True, prefill_step=384, images=()):
     ids = tk.encode(prompt)
-    x = mx.array([ids])
+    if images:
+        ids = qwen35.expand_image_pads(ids, [im.n_tokens for im in images],
+                                       model.cfg.image_token_id)
 
     t0 = time.time()
     # Prefill in windows. Peak memory scales with the window, not the prompt:
@@ -61,10 +67,10 @@ def generate(model, tk, prompt: str, max_tokens=200, temp=1.0, top_p=0.95,
     # window is free. 384 also matches METAL_MAX_L, so the fused delta kernel --
     # not the chunked scan -- handles prefill. Segmented prefill is exact (see
     # test_model.py "chunked prefill == full forward").
-    logits, cache = None, model.make_cache()
-    for s in range(0, x.shape[1], prefill_step):
-        logits, cache = model(x[:, s:s + prefill_step], cache, all_logits=False)
-        mx.eval(logits)
+    cache = model.make_cache()
+    feats = [(model.embed_image(im),) + im.llm_grid for im in images]
+    h, delta = qwen35.prefill(model, cache, ids, feats, 0, prefill_step)
+    logits = model.lm_head(h)
     prefill_t = time.time() - t0
 
     out, buf = [], ""
@@ -82,7 +88,9 @@ def generate(model, tk, prompt: str, max_tokens=200, temp=1.0, top_p=0.95,
             if len(piece) > len(buf) and "�" not in piece[len(buf):]:
                 print(piece[len(buf):], end="", flush=True)
                 buf = piece
-        logits, cache = model(nxt[:, None], cache, all_logits=False)
+        # after an image the rope position is the cache offset plus delta
+        h, cache = model.hidden_states(nxt[:, None], cache, rope=cache[0].offset + delta)
+        logits = model.lm_head(h)
     gen_t = time.time() - t1
 
     if stream:
@@ -108,6 +116,9 @@ def main():
     ap.add_argument("--top-p", type=float, default=0.95)
     ap.add_argument("--top-k", type=int, default=20)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--image", action="append", default=[],
+                    help="a picture to show the model, ahead of the prompt (repeatable)")
+    ap.add_argument("--max-pixels", type=int, default=vision.MAX_PIXELS)
     a = ap.parse_args()
 
     mx.random.seed(a.seed)
@@ -115,9 +126,11 @@ def main():
     tk = Tokenizer(f"{path}/tokenizer.json")
     model, _ = qwen35.load(path)
 
-    p = a.raw if a.raw is not None else chat_prompt(a.prompt, a.system, not a.no_think)
+    images = [vision.load_image(f, max_pixels=a.max_pixels) for f in a.image]
+    p = a.raw if a.raw is not None else chat_prompt(a.prompt, a.system, not a.no_think,
+                                                    len(images))
     print(f"--- prompt ---\n{p}\n--- output ---")
-    generate(model, tk, p, a.max_tokens, a.temp, a.top_p, a.top_k)
+    generate(model, tk, p, a.max_tokens, a.temp, a.top_p, a.top_k, images=images)
 
 
 if __name__ == "__main__":

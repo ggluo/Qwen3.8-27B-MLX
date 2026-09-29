@@ -17,11 +17,16 @@ Two things make it feel fast:
     exact (test_model.py: "chunked prefill == full forward").
   * Speculative decoding via the MTP head, ~1.4x on prose and ~1.9x on code.
 
-In-chat commands: /help /new /think /temp /system /exit
+Images: `/image photo.jpg` attaches a picture to the next message (drag the
+file into the terminal to type its path). `--image` does the same for the
+first one. The checkpoint needs its vision tower, which every Qwen3.5 has.
+
+In-chat commands: /help /new /think /temp /system /image /exit
 """
 
 import argparse
 import os
+import shlex
 import sys
 import time
 
@@ -29,6 +34,7 @@ import mlx.core as mx
 
 import lineread
 import qwen35
+import vision
 from speculative import residual, sample_probs, to_probs
 from tokenizer import Tokenizer
 
@@ -55,33 +61,58 @@ class Session:
         self.tokens = []
         self.cache = self.model.make_cache()
         self.turns = 0
+        # After an image the rope position runs ahead of the token index (an
+        # image of r x c tokens advances it by max(r, c), not r*c); this is how
+        # far. Every decode step and every draft uses cache offset + rope_delta.
+        self.rope_delta = 0
+        self.spans = []            # every image in the context, as ImageSpans
+        self.pending = []          # (embeds, rows, cols) not yet fed to the model
         mx.clear_cache()
 
     # -- feed everything the model has not seen yet; return hidden at the end --
     def _sync(self):
         lo = self.cache[0].offset
-        need = self.tokens[lo:]
-        h = None
-        for s in range(0, len(need), self.prefill_step):
-            h, self.cache = self.model.hidden_states(
-                mx.array([need[s:s + self.prefill_step]]), self.cache)
-            mx.eval(h)
-        return h[:, -1:]
+        h, self.rope_delta = qwen35.prefill(self.model, self.cache, self.tokens[lo:],
+                                            self.pending, self.rope_delta,
+                                            self.prefill_step)
+        self.pending = []
+        return h
 
-    def _prompt_tokens(self, text, think):
+    def _prompt_tokens(self, text, think, images=()):
         p = ""
         if self.turns == 0 and self.system:
             p += f"<|im_start|>system\n{self.system}<|im_end|>\n"
-        p += f"<|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\n"
+        # The template renders a message's parts in order; for a typed message
+        # the pictures go first, which is how the model card lays them out.
+        pics = "<|vision_start|><|image_pad|><|vision_end|>" * len(images)
+        p += f"<|im_start|>user\n{pics}{text}<|im_end|>\n<|im_start|>assistant\n"
         # the template always opens a reasoning block; closing it immediately
         # is how you disable thinking
         p += "<think>\n" if think else "<think>\n\n</think>\n\n"
-        return self.tk.encode(p)
+        ids = self.tk.encode(p)
+        if not images:
+            if self.model.cfg.image_token_id in ids:
+                raise ValueError("the message contains a literal <|image_pad|> token")
+            return ids
+        return qwen35.expand_image_pads(ids, [im.n_tokens for im in images],
+                                        self.model.cfg.image_token_id)
 
     def turn(self, text, think=False, temp=0.7, top_p=0.95, top_k=20,
-             max_tokens=1024):
-        """Generator yielding decoded text as it is produced."""
-        self.tokens += self._prompt_tokens(text, think)
+             max_tokens=1024, images=()):
+        """Generator yielding decoded text as it is produced. `images` are
+        vision.Image objects, shown to the model ahead of the text."""
+        new = self._prompt_tokens(text, think, images)
+        # Encode the pictures before touching the token list, so a failure
+        # (no vision tower, say) leaves the conversation as it was.
+        feats = [(self.model.embed_image(im),) + im.llm_grid for im in images]
+        if feats:
+            mx.eval([f for f, _, _ in feats])
+        base = len(self.tokens)
+        self.tokens += new
+        if images:
+            self.spans += qwen35.find_image_spans(new, [im.llm_grid for im in images],
+                                                  self.model.cfg.image_token_id, base)
+            self.pending += feats
         start_len = len(self.tokens)
         h = self._sync()
 
@@ -130,6 +161,11 @@ class Session:
             if not isinstance(c, qwen35.DeltaCache):
                 c.trim(base)
         del self.tokens[base:]          # drop tokens the model never consumed
+        # the rope delta is a function of which images survive, and how much of each
+        self.spans = [sp for sp in self.spans if sp.start < base]
+        self.rope_delta = sum(qwen35.delta_contribution(sp, min(sp.n, base - sp.start))
+                              for sp in self.spans)
+        self.pending = []
         self._close_turn(base, {"n": 0, "rounds": 0, "drafted": 0,
                                 "accepted": 0, "t0": time.time()})
 
@@ -145,7 +181,8 @@ class Session:
     def _plain_loop(self, h, tok, emitted, stats, temp, top_p, top_k, max_tokens):
         printed = self.tk.decode(emitted)
         while stats["n"] < max_tokens:
-            h, self.cache = self.model.hidden_states(mx.array([[tok]]), self.cache)
+            h, self.cache = self.model.hidden_states(
+                mx.array([[tok]]), self.cache, rope=self.cache[0].offset + self.rope_delta)
             p = to_probs(self.model.lm_head(h)[0, -1], temp, top_p, top_k)
             tok = sample_probs(p)
             if tok in EOS:
@@ -169,7 +206,8 @@ class Session:
         mtp_cache = model.mtp.make_cache()
         printed = self.tk.decode(emitted)
         P = self.cache[0].offset
-        A_tok, A_hid, A_pos = mx.array([[first]]), h, P
+        d = self.rope_delta             # constant for the whole reply: no images in it
+        A_tok, A_hid, A_pos = mx.array([[first]]), h, P + d
         next_tok = mx.array([[first]])
 
         while stats["n"] < max_tokens:
@@ -181,7 +219,7 @@ class Session:
             for i in range(k):
                 if i:
                     h_prev = model.mtp(model.embed_tokens(mx.array([[dl[-1]]])),
-                                       h_prev, mtp_cache, P_old + i)
+                                       h_prev, mtp_cache, P_old + i + d)
                 q = to_probs(model.lm_head(h_prev)[0, -1], temp, top_p, top_k)
                 qs.append(q)
                 dl.append(sample_probs(q))
@@ -190,7 +228,7 @@ class Session:
             for c in self.cache:
                 if isinstance(c, qwen35.DeltaCache):
                     c.record = True
-            h_v, self.cache = model.hidden_states(X, self.cache)
+            h_v, self.cache = model.hidden_states(X, self.cache, rope=P_old + d)
             tl = model.lm_head(h_v)[0]
             ps = [to_probs(tl[i], temp, top_p, top_k) for i in range(k + 1)]
 
@@ -239,7 +277,7 @@ class Session:
             next_tok = mx.array([[corrected]])
             A_tok = mx.array([dl[:j] + [corrected]])
             A_hid = h_v[:, :j + 1]
-            A_pos = P_old + 1
+            A_pos = P_old + 1 + d
 
 
 DIM, RESET = "\033[2m", "\033[0m"
@@ -293,6 +331,8 @@ HELP = """
   /think [on|off]   show the model's reasoning (slower)
   /temp <float>     sampling temperature (0 = deterministic)
   /system <text>    set a system prompt (applies to the next /new)
+  /image <path>...  attach pictures to your next message (drag a file here);
+                    /image alone lists them, /image clear drops them
   /stats            timing for the last reply
   /help             this
   /exit             quit (Ctrl-D also works)
@@ -315,6 +355,13 @@ def main():
     ap.add_argument("-k", "--draft", type=int, default=3)
     ap.add_argument("--no-spec", action="store_true")
     ap.add_argument("-n", "--max-tokens", type=int, default=1024)
+    ap.add_argument("--image", action="append", default=[],
+                    help="attach a picture to the first message (repeatable)")
+    ap.add_argument("--max-pixels", type=int, default=vision.MAX_PIXELS,
+                    help="downscale pictures above this many pixels; every "
+                         f"{vision.FACTOR}x{vision.FACTOR} is one token "
+                         f"(default {vision.MAX_PIXELS}, i.e. at most "
+                         f"{vision.MAX_PIXELS // vision.FACTOR ** 2} tokens a picture)")
     a = ap.parse_args()
 
     # Resolve the model relative to this script, not the cwd, so a launcher on
@@ -330,7 +377,30 @@ def main():
     think, temp = a.think, a.temp
     print(f"ready in {time.time()-t0:.1f}s"
           f"{'' if s.spec else '  (no MTP head: plain decoding)'}"
+          f"{'' if model.has_vision else '  (no vision tower: text only)'}"
           f"   /help for commands, /exit to quit\n", file=sys.stderr)
+
+    attached = []                   # (name, vision.Image) for the next message
+
+    def attach(paths):
+        if not model.has_vision:
+            print(f"{DIM}this checkpoint has no vision tower; it cannot take pictures{RESET}")
+            return
+        for p in paths:
+            p = os.path.expanduser(p)
+            try:
+                im = vision.load_image(p, max_pixels=a.max_pixels)
+            except (OSError, ValueError) as e:
+                print(f"{DIM}cannot attach {p}: {e}{RESET}")
+                continue
+            attached.append((os.path.basename(p), im))
+            w, h = im.size
+            rw, rh = im.resized
+            print(f"{DIM}attached {os.path.basename(p)}: {w}x{h}"
+                  f"{'' if (w, h) == (rw, rh) else f' -> {rw}x{rh}'}, "
+                  f"{im.n_tokens} tokens{RESET}")
+
+    attach(a.image)
 
     while True:
         try:
@@ -385,6 +455,19 @@ def main():
                 if not text:
                     continue
                 send = True             # fall through to generation
+            elif cmd == "image":
+                if arg == "clear":
+                    attached.clear()
+                    print(f"{DIM}attachments dropped{RESET}")
+                elif arg:
+                    try:
+                        attach(shlex.split(arg))
+                    except ValueError as e:        # an unbalanced quote
+                        print(f"{DIM}cannot read the path: {e}{RESET}")
+                elif attached:
+                    print(f"{DIM}attached: {', '.join(n for n, _ in attached)}{RESET}")
+                else:
+                    print(f"{DIM}nothing attached; /image <path> to attach{RESET}")
             elif cmd == "stats":
                 st = getattr(s, "last", None)
                 if st:
@@ -403,12 +486,16 @@ def main():
             if not send:
                 continue
 
+        images = [im for _, im in attached]
+        attached.clear()                # whatever happens, they went with this one
         try:
-            stream = s.turn(text, think, temp, a.top_p, a.top_k, a.max_tokens)
+            stream = s.turn(text, think, temp, a.top_p, a.top_k, a.max_tokens, images)
             for piece in style_stream(stream, think):
                 sys.stdout.write(piece)
                 sys.stdout.flush()
             print()
+        except ValueError as e:
+            print(f"{DIM}{e}{RESET}")
         except KeyboardInterrupt:
             s.interrupt()          # resync caches, keep the context usable
             print("\n\033[2m^C interrupted\033[0m")

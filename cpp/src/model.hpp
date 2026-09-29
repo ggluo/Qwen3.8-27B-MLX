@@ -25,10 +25,17 @@
 // an error -- and both cost real debugging time in the Python original:
 // zero-centered norm gammas (see RMSNorm) and normalize-then-gate in the gated
 // norm (see GatedRMSNorm). Do not "simplify" either.
+//
+// Images: the vision tower is vision.hpp. Its features replace the
+// <|image_pad|> token embeddings, and the full-attention layers switch to real
+// M-RoPE for them (see Rope and prefill()). For text, M-RoPE degenerates exactly
+// to standard RoPE -- t, h and w are all the token's position -- so the text
+// path is unchanged.
 #pragma once
 
 #include <mlx/mlx.h>
 
+#include <memory>
 #include <optional>
 #include <set>
 #include <string>
@@ -66,6 +73,12 @@ struct Config {
   int linear_value_head_dim = 128;
   int linear_conv_kernel_dim = 4;
   int mtp_num_hidden_layers = 0;
+  // M-RoPE: how the rotary frequencies split between the (t, h, w) axes
+  std::vector<int> mrope_section{11, 11, 10};
+  // multimodal token ids, from the top level of config.json
+  int image_token_id = 248056;
+  int vision_start_token_id = 248053;
+  int vision_end_token_id = 248054;
   // quantization, from the checkpoint's own record
   bool quantized = false;
   int group_size = 64;
@@ -111,12 +124,17 @@ struct GatedRMSNorm {
 };
 
 // A weight matrix, 4-bit quantized or plain bf16, stored (out_features, in).
+//
+// Two different "biases": `biases` belongs to the quantization (the per-group
+// offset), `bias` is the layer's additive bias. The text model has none; the
+// vision tower has one on every linear.
 struct Linear {
   mx::array w;
   std::optional<mx::array> scales;
   std::optional<mx::array> biases;
   int group_size = 64;
   int bits = 4;
+  std::optional<mx::array> bias;
 
   bool quantized() const { return scales.has_value(); }
   mx::array operator()(const mx::array& x) const;
@@ -215,6 +233,24 @@ struct LayerCache {
 // blocks
 // ---------------------------------------------------------------------------
 
+// Where a forward pass takes its rope positions from.
+//
+// The rope position is not always the cache index. The MTP drafter's cache
+// starts mid-sequence, and after an image the positions run ahead of the token
+// count: an image of r x c tokens takes r*c slots but only max(r, c) positions.
+struct Rope {
+  std::optional<int> start;            // position of the first token, then consecutive
+  std::optional<mx::array> positions;  // (3, L) explicit (t, h, w): a chunk with image tokens
+
+  static Rope at(int s) { return Rope{s, std::nullopt}; }
+  // neither set: the positions are the cache offsets
+};
+
+// Which position axis -- 0 t, 1 h, 2 w -- each of the rotary_dim/2 frequencies
+// reads. INTERLEAVED (THWTHW...TH for [11, 11, 10]), not chunked; checked in the
+// Python port against transformers' Qwen3-VL apply_interleaved_mrope.
+std::vector<int> mrope_axes(int rotary_dim, const std::vector<int>& section);
+
 struct Attention {
   int n_heads, n_kv, hd, rotary_dim;
   float scale, rope_theta;
@@ -222,10 +258,10 @@ struct Attention {
   Linear q_proj, k_proj, v_proj, o_proj;
   RMSNorm q_norm, k_norm;
 
-  // `rope_offset` overrides the position used for RoPE. The MTP drafter's KV
-  // cache starts mid-sequence, so its cache index and absolute position differ.
+  std::vector<int> mrope_section;
+
   mx::array operator()(const mx::array& x, const std::optional<mx::array>& mask,
-                       KVCache* cache, std::optional<int> rope_offset) const;
+                       KVCache* cache, const Rope& rope) const;
 };
 
 struct GatedDeltaNet {
@@ -251,7 +287,7 @@ struct Layer {
   MLP mlp;
 
   mx::array operator()(const mx::array& x, const std::optional<mx::array>& mask,
-                       LayerCache* cache, std::optional<int> rope_offset) const;
+                       LayerCache* cache, const Rope& rope) const;
 };
 
 // Multi-Token Prediction head, used here as a self-speculative drafter.
@@ -278,6 +314,11 @@ struct MTPDraft {
 // model
 // ---------------------------------------------------------------------------
 
+struct VisionModel;
+namespace image {
+struct Image;
+}
+
 struct Model {
   Config cfg;
   Embedding embed_tokens;
@@ -285,12 +326,26 @@ struct Model {
   RMSNorm norm;
   Linear lm_head;
   std::optional<MTPDraft> mtp;
+  // Null for a checkpoint without one. Its weights are read from disk the first
+  // time an image is embedded, so a text-only session never pays for them.
+  std::shared_ptr<VisionModel> visual;
+
+  bool has_vision() const { return visual != nullptr; }
 
   std::vector<LayerCache> make_cache() const;
 
+  // One preprocessed image -> (n_tokens, hidden): what its <|image_pad|> tokens'
+  // embeddings are replaced with. Throws if there is no vision tower.
+  mx::array embed_image(const image::Image& img) const;
+
   // Post-norm hidden: exactly the tensor fed to lm_head, and what the MTP
   // drafter consumes (it applies its own pre_fc_norm_hidden).
-  mx::array hidden_states(const mx::array& ids, std::vector<LayerCache>& cache) const;
+  //
+  // `image_embeds` are the features for the <|image_pad|> tokens in ids, in
+  // order. prefill() below builds both it and `rope` for a prompt with images.
+  mx::array hidden_states(const mx::array& ids, std::vector<LayerCache>& cache,
+                          const Rope& rope = Rope{},
+                          const std::optional<mx::array>& image_embeds = std::nullopt) const;
 
   mx::array logits(const mx::array& h) const { return lm_head(h); }
 
@@ -304,3 +359,46 @@ struct Model {
 // needs is missing or misshaped -- the structural check that the Python port
 // got from `strict=True`.
 Model load_model(const std::string& path, bool verbose = true);
+
+// ---------------------------------------------------------------------------
+// prompts with images
+// ---------------------------------------------------------------------------
+
+// Where one image sits in a token sequence, and its grid of LLM tokens.
+struct ImageSpan {
+  int start;  // index of its first <|image_pad|>
+  int rows, cols;
+  int n() const { return rows * cols; }
+};
+
+// How far an image pushes the rope position ahead of the token index:
+// max(rows, cols) - rows*cols. The deltas of successive images add.
+int delta_contribution(const ImageSpan& span);
+
+// The template writes one <|image_pad|> per image; the model needs one per image
+// TOKEN. Expands the k-th pad into counts[k]. Throws on a count mismatch.
+std::vector<int> expand_image_pads(const std::vector<int>& ids, const std::vector<int>& counts,
+                                   int pad);
+
+// Each image's run of pad tokens, given the images' (rows, cols) in order.
+std::vector<ImageSpan> find_image_spans(const std::vector<int>& ids,
+                                        const std::vector<std::pair<int, int>>& grids,
+                                        int pad, int base = 0);
+
+struct ImageFeatures {
+  mx::array embeds;  // from Model::embed_image
+  int rows, cols;
+};
+
+// Feeds ids -- everything the cache has not seen -- in windows of `step`.
+// `images` covers the images whose pad tokens are in ids, in order; `delta` is
+// the rope offset in force before ids[0]. Returns the hidden state at the last
+// position (1, 1, hidden) and the delta after ids.
+//
+// A window may cut an image in two; each gets its slice of the positions and of
+// the features. A window with no image token takes the ordinary scalar rope path
+// even inside a multimodal prompt, since its positions are consecutive.
+std::pair<mx::array, int> prefill(const Model& model, std::vector<LayerCache>& cache,
+                                  const std::vector<int>& ids,
+                                  const std::vector<ImageFeatures>& images, int delta,
+                                  int step);
