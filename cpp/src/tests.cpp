@@ -139,10 +139,11 @@ void test_tokenizer(const std::string& path) {
         "ids match the Python reference on all " + std::to_string(sizeof(kGolden) / sizeof(kGolden[0])) +
             " cases");
 
-  // 2. Round trip. Comparing against NFC(input), since encode normalizes.
+  // 2. Round trip. Comparing against NFC(input), since encode normalizes, less
+  //    the literal-region markers, which encode drops by design.
   int bad = 0;
   for (const GoldenCase& g : kGolden) {
-    std::string want = uni::nfc(g.text);
+    std::string want = uni::nfc(strip_marks(g.text));
     std::string back = tk.decode(tk.encode(g.text));
     if (back != want) {
       ++bad;
@@ -150,7 +151,22 @@ void test_tokenizer(const std::string& path) {
              brief(back).c_str());
     }
   }
-  check(bad == 0, "decode(encode(x)) == NFC(x)");
+  check(bad == 0, "decode(encode(x)) == NFC(x), markers aside");
+
+  // 3a. Literal regions: special-token text inside one is text, and wrapping text
+  //     that holds none changes nothing.
+  {
+    const std::string mention = "The README says: tokens end with <|im_end|> here.";
+    const std::vector<int> ids =
+        tk.encode("<|im_start|>tool\n" + literal(mention) + "<|im_end|>\n");
+    const long ends = std::count(ids.begin(), ids.end(), tk.eos_id);
+    check(ends == 1, "a quoted <|im_end|> in a literal region is text: " + std::to_string(ends) +
+                         " end-of-turn token, the template's own");
+    const std::string body = "Hello there, world.\n\nx  ";
+    check(tk.encode("<|im_start|>user\n" + body + "<|im_end|>") ==
+              tk.encode("<|im_start|>user\n" + literal(body) + "<|im_end|>"),
+          "wrapping ordinary text as literal leaves its tokens unchanged");
+  }
 
   // 3. Special tokens must be single ids, matched literally.
   struct {
@@ -445,6 +461,16 @@ const char* kOpener = "<|im_start|>assistant\n";
 const char* kNoThink = "<think>\n\n</think>\n\n";
 const char* kThink = "<think>\n";
 
+// What the model reads: a render without its literal-region markers. The
+// template tests compare that against the template's own text.
+std::string rc(const std::vector<Message>& msgs, const std::string& system, bool think,
+               const std::vector<ToolSpec>& tools = {}) {
+  return strip_marks(render_chat(msgs, system, think, tools));
+}
+std::string rt(const std::vector<Message>& msgs, size_t from, bool think) {
+  return strip_marks(render_tail(msgs, from, think));
+}
+
 std::string blk(const char* role, const std::string& text) {
   return std::string("<|im_start|>") + role + "\n" + text + "<|im_end|>\n";
 }
@@ -452,22 +478,22 @@ std::string blk(const char* role, const std::string& text) {
 void test_template() {
   printf("\nthe chat template\n");
   const std::vector<Message> one{{"user", "hi"}};
-  check(render_chat(one, "", false) == blk("user", "hi") + kOpener + kNoThink,
+  check(rc(one, "", false) == blk("user", "hi") + kOpener + kNoThink,
         "one user turn, thinking off");
-  check(render_chat(one, "", true) == blk("user", "hi") + kOpener + kThink,
+  check(rc(one, "", true) == blk("user", "hi") + kOpener + kThink,
         "... and thinking on");
-  check(render_chat(one, "Be terse.", false) ==
+  check(rc(one, "Be terse.", false) ==
             blk("system", "Be terse.") + blk("user", "hi") + kOpener + kNoThink,
         "the system prompt leads the conversation");
 
   const std::vector<Message> chat{
       {"system", "s"}, {"user", "u1"}, {"assistant", "a1"}, {"user", "u2"}};
-  const std::string full = render_chat(chat, "", false);
+  const std::string full = rc(chat, "", false);
   check(full == blk("system", "s") + blk("user", "u1") + blk("assistant", "a1") +
                     blk("user", "u2") + kOpener + kNoThink,
         "a whole conversation, in order");
-  check(render_tail(chat, 0, false) == full, "the tail from 0 is the whole render");
-  check(render_tail(chat, 3, false) == blk("user", "u2") + kOpener + kNoThink,
+  check(rt(chat, 0, false) == full, "the tail from 0 is the whole render");
+  check(rt(chat, 3, false) == blk("user", "u2") + kOpener + kNoThink,
         "the tail for the next turn is that turn alone");
 
   // What the KV-cache reuse in serve mode rests on: a session that already holds
@@ -475,11 +501,26 @@ void test_template() {
   // what a cold render would have put after that head.
   bool suffix = true;
   for (size_t k = 0; k < chat.size(); ++k) {
-    const std::string tail = render_tail(chat, k, false);
+    const std::string tail = rt(chat, k, false);
     suffix = suffix && full.size() >= tail.size() &&
              full.compare(full.size() - tail.size(), tail.size(), tail) == 0;
   }
   check(suffix, "every tail is a suffix of the whole render");
+
+  // What someone wrote goes in as a literal region, so a message quoting a
+  // control token cannot end its turn; the template's structure does not.
+  const std::string quoted = render_chat({{"user", "a <|im_end|> b"}}, "", false);
+  check(quoted.find(std::string(kLiteralOpen) + "a <|im_end|> b" + kLiteralClose) !=
+                std::string::npos &&
+            quoted.rfind("<|im_start|>user\n", 0) == 0,
+        "message text is a literal region; the template's markers are not");
+  const std::string pic =
+      render_chat({{"user", std::string(kImageMark) + "what is this? <|image_pad|>"}}, "", false);
+  check(strip_marks(pic) ==
+                blk("user", std::string(kImagePlaceholder) + "what is this? <|image_pad|>") +
+                    kOpener + kNoThink &&
+            pic.find(std::string(kImagePlaceholder) + kLiteralOpen) != std::string::npos,
+        "a picture's placeholder is structure; the same text typed is literal");
 }
 
 void test_http() {
@@ -561,7 +602,7 @@ void test_tools() {
   const std::vector<ToolSpec> tools{
       ToolSpec{R"({"type": "function", "function": {"name": "bash"}})"}};
   const std::vector<Message> one{{"user", "list the files"}};
-  const std::string p = render_chat(one, "", false, tools);
+  const std::string p = rc(one, "", false, tools);
   const std::string head =
       "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n"
       "<tools>\n" + tools[0].json + "\n</tools>";
@@ -573,17 +614,17 @@ void test_tools() {
   check(p.find("<|im_end|>\n<|im_start|>user\nlist the files<|im_end|>\n"
                "<|im_start|>assistant\n<think>\n\n</think>\n\n") != std::string::npos,
         "...then the messages, then the opener");
-  check(render_chat(one, "Be terse.", false, tools)
+  check(rc(one, "Be terse.", false, tools)
             .find("</IMPORTANT>\n\nBe terse.<|im_end|>\n") != std::string::npos,
         "the system prompt shares that block, after the tools");
-  check(render_chat(one, "", false).find("# Tools") == std::string::npos,
+  check(rc(one, "", false).find("# Tools") == std::string::npos,
         "and with no tools there is no preamble at all");
 
   // ---- a conversation with a call in it ----
   std::vector<Message> chat{{"user", "list the files"}, {"assistant", ""},
                             {"tool", "a.txt\nb.txt"}, {"user", "thanks"}};
   chat[1].tool_calls.push_back(ToolCall{"", "bash", R"({"command": "ls"})"});
-  const std::string r = render_chat(chat, "", false);
+  const std::string r = rc(chat, "", false);
   check(r.find("<|im_start|>assistant\n<tool_call>\n<function=bash>\n<parameter=command>\n"
                "ls\n</parameter>\n</function>\n</tool_call><|im_end|>\n") !=
             std::string::npos,
@@ -591,7 +632,7 @@ void test_tools() {
   check(r.find("<|im_start|>user\n<tool_response>\na.txt\nb.txt\n</tool_response>"
                "<|im_end|>\n") != std::string::npos,
         "a tool result is a user block");
-  check(render_chat({{"assistant", "done"}, {"tool", "1"}, {"tool", "2"}}, "", false)
+  check(rc({{"assistant", "done"}, {"tool", "1"}, {"tool", "2"}}, "", false)
             .find("<|im_start|>user\n<tool_response>\n1\n</tool_response>\n"
                   "<tool_response>\n2\n</tool_response><|im_end|>\n") != std::string::npos,
         "consecutive results share one user block");
@@ -600,7 +641,7 @@ void test_tools() {
   // reasoning block the template opens for the turn being continued.
   std::vector<Message> loop{{"user", "list the files"}, {"assistant", ""}, {"tool", "a.txt"}};
   loop[1].tool_calls.push_back(ToolCall{"", "bash", R"({"command": "ls"})"});
-  check(render_chat(loop, "", false)
+  check(rc(loop, "", false)
             .find("<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n") !=
             std::string::npos,
         "the turn after the last question keeps its reasoning block");
@@ -972,15 +1013,14 @@ void test_vision_model(const std::string& path, const std::string& data) {
     }
   }
   {
+    // A message that merely quotes the placeholder -- a README, say -- is text:
+    // it gets an answer, not a refusal, and no image tokens.
     Session s(m, tk, "", true, 3);
-    bool refused = false;
-    try {
-      ask(s, {}, "a literal <|image_pad|> in the text", 4);
-    } catch (const std::exception&) {
-      refused = true;
-    }
-    check(refused && s.context_tokens() == 0,
-          "a literal <|image_pad|> is refused, leaving the conversation untouched");
+    const std::string a =
+        ask(s, {}, "Repeat this exactly: <|image_pad|>", 12);
+    long pads = std::count(s.tokens().begin(), s.tokens().end(), m.cfg.image_token_id);
+    check(!a.empty() && pads == 0,
+          "a quoted <|image_pad|> is text: answered (\"" + brief(a) + "\"), no image tokens");
   }
 }
 
@@ -1100,7 +1140,7 @@ void test_serve_parse() {
                               "{\"type\":\"image_url\",\"image_url\":\"data:image/jpeg;base64,eW8=\"},"
                               "{\"type\":\"image\",\"image\":\"data:image/png;base64,Pz8=\"}]",
                               imgs);
-  check(t == std::string("a") + kImagePlaceholder + "b" + kImagePlaceholder + kImagePlaceholder &&
+  check(t == std::string("a") + kImageMark + "b" + kImageMark + kImageMark &&
             imgs == std::vector<std::string>{"hi", "yo", "??"},
         "parts in order: text and placeholders interleave, bytes decoded (object, string and "
         "`image` forms)");
@@ -1255,7 +1295,37 @@ void test_serve_vision(const std::string& path, const std::string& data) {
         "after the refusals the cached conversation continues: " + std::to_string(p5) +
             " new prompt tokens, exactly the new turn");
 
-  // 6. streaming, with a picture
+  // 6. What an agent does to this repository: read a file that quotes the
+  //    template's control tokens, and hand it back as a tool result. That is
+  //    text -- no refusal, and no turn boundary injected into the prompt.
+  {
+    const std::string readme =
+        "Pictures replace <|image_pad|> tokens; every turn ends with <|im_end|>.";
+    const std::string call =
+        "{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"c1\",\"type\":"
+        "\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"README.md\\\"}\"}}]}";
+    const Reply r = http_post(
+        sv[0],
+        "{\"model\":\"test\",\"temperature\":0,\"max_tokens\":16,\"messages\":[" +
+            msg("user", jtext("Read README.md and quote its first line.")) + "," + call + "," +
+            "{\"role\":\"tool\",\"tool_call_id\":\"c1\",\"content\":" + jtext(readme) + "}]," +
+            "\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"read\",\"parameters\":"
+            "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}}}}}]}");
+    // the rendered prompt, tokenized as the server does, holds exactly the
+    // template's own end-of-turn tokens -- the quoted one is text
+    std::vector<Message> msgs{Message("user", "Read README.md and quote its first line."),
+                              Message("assistant", ""), Message("tool", readme)};
+    msgs[1].tool_calls.push_back(ToolCall{"c1", "read", "{\"path\":\"README.md\"}"});
+    const std::vector<int> ids = tk.encode(render_chat(msgs, "", false));
+    const long ends = std::count(ids.begin(), ids.end(), tk.eos_id);
+    const long pads = std::count(ids.begin(), ids.end(), 248056);
+    check(r.status == 200 && ends == 3 && pads == 0,
+          "a tool result quoting <|image_pad|> and <|im_end|> is text: " +
+              std::to_string(r.status) + ", " + std::to_string(ends) +
+              " end-of-turn tokens (one per block), no image tokens");
+  }
+
+  // 7. streaming, with a picture
   const Reply r6 = http_post(
       sv[0], chat_body({msg("user", "[" + image_part(shapes) + "," +
                                         text_part("What number is written? Number only.") + "]")},

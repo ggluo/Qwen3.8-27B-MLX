@@ -303,6 +303,14 @@ Four things worth knowing:
   on one thread and generating on another fails with `There is no Stream(gpu, N)
   in current thread` — which is exactly what a thread-per-request server does by
   accident.
+* **What a client sends is text, never control tokens.** Message content, tool
+  results, reasoning, arguments, the system prompt and the tool schemas all go
+  into the prompt as literal regions (see `tokenizer.hpp`), so only the
+  template's own structure becomes `<|im_start|>`, `<|im_end|>`, `<tool_call>`
+  and the rest. Without that, an agent that reads a file quoting `<|im_end|>` —
+  this repository's READMEs do — injects a turn boundary into its own
+  conversation, and one quoting `<|image_pad|>` claimed a picture that was never
+  sent. Only a real `image_url` part places image tokens.
 * **The prompt is the checkpoint's chat template, written out in C++.** The real
   one is a Jinja file, and interpreting it would mean shipping a Jinja engine, so
   serve mode reads `<model>/chat_template.jinja` at load and checks it against
@@ -339,7 +347,7 @@ Four things worth knowing:
 
 ## What is verified
 
-`make test` — 141 checks, all passing (119 of them need no weights at all):
+`make test` — 146 checks, all passing (123 of them need no weights at all):
 
 * **Tokenizer ids are identical to the Python implementation** on 22 cases
   covering contractions, CJK, emoji, combining accents, tabs/CRLF, code fences,
@@ -385,7 +393,9 @@ Four things worth knowing:
   context.
 * **Serve mode takes pictures over its real HTTP path**, driven through a
   `socketpair()` — a test cannot bind a port, but a socket pair needs no network:
-  a picture cold; an echoed history that continues from the cache, feeding
+  a tool result that quotes `<|image_pad|>` and `<|im_end|>`, read as text
+  with exactly one end-of-turn token per block; a picture cold; an echoed
+  history that continues from the cache, feeding
   *exactly* the new turn's tokens and not the echoed reply again, two turns in
   a row; a history that leaves out the reply, and a swapped picture, both of
   which must start over; every refusal as a `400` with the cached conversation

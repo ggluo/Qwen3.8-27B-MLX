@@ -14,18 +14,20 @@ import mlx.core as mx
 
 import qwen35
 import vision
-from tokenizer import Tokenizer
+from tokenizer import Tokenizer, literal
 
 EOS = (248046, 248044)  # <|im_end|>, <|endoftext|>
 
 
 def chat_prompt(user: str, system: str = None, think: bool = True,
                 n_images: int = 0) -> str:
+    # user and system text are literal regions: a special token's text in them is
+    # text (see tokenizer.literal); --raw bypasses all of this
     p = ""
     if system:
-        p += f"<|im_start|>system\n{system}<|im_end|>\n"
+        p += f"<|im_start|>system\n{literal(system)}<|im_end|>\n"
     pics = "<|vision_start|><|image_pad|><|vision_end|>" * n_images
-    p += f"<|im_start|>user\n{pics}{user}<|im_end|>\n<|im_start|>assistant\n"
+    p += f"<|im_start|>user\n{pics}{literal(user)}<|im_end|>\n<|im_start|>assistant\n"
     # the template opens a reasoning block; closing it immediately disables thinking
     p += "<think>\n" if think else "<think>\n\n</think>\n\n"
     return p

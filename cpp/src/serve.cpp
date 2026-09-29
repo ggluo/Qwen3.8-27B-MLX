@@ -604,7 +604,9 @@ std::string image_bytes(const std::string& url) {
 }  // namespace
 
 std::string flatten_content(const json::Value& content, std::vector<std::string>& images) {
-  if (content.type == json::Type::Str) return content.str;
+  // Client text is stripped of the markers the renderer gives meaning to, so it
+  // can neither place a picture nor end its own literal region.
+  if (content.type == json::Type::Str) return strip_marks(content.str);
   if (content.is_null()) return "";
   if (!content.is_arr()) {
     throw std::runtime_error("message content must be a string or an array of parts");
@@ -613,7 +615,7 @@ std::string flatten_content(const json::Value& content, std::vector<std::string>
   for (const json::Value& part : content.arr) {
     const std::string type = part["type"].as_str();
     if (type == "text" || type == "input_text") {
-      text += part["text"].as_str();
+      text += strip_marks(part["text"].as_str());
     } else if (type == "image_url" || type == "input_image" || type == "image") {
       // {"image_url": {"url": ...}} is the API's shape; a bare string there, and
       // {"type": "image", "image": ...}, are what other clients send.
@@ -622,7 +624,7 @@ std::string flatten_content(const json::Value& content, std::vector<std::string>
       if (url.empty()) url = part["image"].as_str();
       if (url.empty()) throw std::runtime_error("an image part has no url");
       images.push_back(image_bytes(url));
-      text += kImagePlaceholder;
+      text += kImageMark;
     }
   }
   return text;
@@ -1116,7 +1118,9 @@ bool Server::handle(const ChatRequest& cr, int fd) {
   // What actually went to the model. A cold render is the whole conversation,
   // system prompt and tools included; a continued one is the tail, and it is
   // named as a tail so that nobody reads half a conversation as a whole prompt.
-  dump_text(opt.dump_dir, cr.dump_no, from > 0 ? "prompt-tail.txt" : "prompt.txt", prompt);
+  // (without the literal-region markers, which are not text the model reads)
+  dump_text(opt.dump_dir, cr.dump_no, from > 0 ? "prompt-tail.txt" : "prompt.txt",
+            strip_marks(prompt));
 
   // The pictures this prompt carries: only those in the messages being fed now,
   // since the earlier ones are already in the context. Decoded here, before
@@ -1127,16 +1131,11 @@ bool Server::handle(const ChatRequest& cr, int fd) {
   {
     size_t n = 0;
     for (size_t i = from; i < cr.msgs.size(); ++i) n += cr.msgs[i].images.size();
-    size_t pads = 0;
-    for (size_t at = prompt.find("<|image_pad|>"); at != std::string::npos;
-         at = prompt.find("<|image_pad|>", at + 1)) {
-      ++pads;
-    }
+    // (A literal "<|image_pad|>" in a message -- a README an agent read -- is
+    // plain text by now: only the pictures themselves place image tokens.)
     std::string bad;
     if (n > 0 && !model.has_vision()) {
       bad = "this model has no vision tower; it cannot take images";
-    } else if (pads != n) {
-      bad = "the messages contain a literal <|image_pad|> token";
     }
     for (size_t i = from; i < cr.msgs.size() && bad.empty(); ++i) {
       for (size_t k = 0; k < cr.msgs[i].images.size() && bad.empty(); ++k) {

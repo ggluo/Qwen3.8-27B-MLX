@@ -36,7 +36,7 @@ import lineread
 import qwen35
 import vision
 from speculative import residual, sample_probs, to_probs
-from tokenizer import Tokenizer
+from tokenizer import Tokenizer, literal
 
 EOS = (248046, 248044)          # <|im_end|>, <|endoftext|>
 
@@ -79,21 +79,21 @@ class Session:
         return h
 
     def _prompt_tokens(self, text, think, images=()):
+        # What you type -- and the system prompt -- go in as literal regions
+        # (tokenizer.literal): a pasted README that mentions <|im_end|> is text,
+        # not the end of your turn. Only the template's structure, and the
+        # pictures' placeholders, become control tokens.
         p = ""
-        if self.turns == 0 and self.system:
-            p += f"<|im_start|>system\n{self.system}<|im_end|>\n"
+        if self.turns == 0 and self.system and self.system.strip():
+            p += f"<|im_start|>system\n{literal(self.system.strip())}<|im_end|>\n"
         # The template renders a message's parts in order; for a typed message
         # the pictures go first, which is how the model card lays them out.
         pics = "<|vision_start|><|image_pad|><|vision_end|>" * len(images)
-        p += f"<|im_start|>user\n{pics}{text}<|im_end|>\n<|im_start|>assistant\n"
+        p += f"<|im_start|>user\n{pics}{literal(text)}<|im_end|>\n<|im_start|>assistant\n"
         # the template always opens a reasoning block; closing it immediately
         # is how you disable thinking
         p += "<think>\n" if think else "<think>\n\n</think>\n\n"
         ids = self.tk.encode(p)
-        if not images:
-            if self.model.cfg.image_token_id in ids:
-                raise ValueError("the message contains a literal <|image_pad|> token")
-            return ids
         return qwen35.expand_image_pads(ids, [im.n_tokens for im in images],
                                         self.model.cfg.image_token_id)
 

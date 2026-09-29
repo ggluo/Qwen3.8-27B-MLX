@@ -284,42 +284,104 @@ std::vector<int> Tokenizer::bpe(const std::string& piece) const {
   return ids;
 }
 
-std::vector<int> Tokenizer::encode(const std::string& text, bool allow_special) const {
-  std::string norm = normalize_ ? uni::nfc(text) : text;
+namespace {
 
-  // Split out the special tokens first; they are matched literally and never
-  // reach the BPE. `false` marks ordinary text.
-  std::vector<std::pair<std::string, bool>> chunks{{norm, false}};
-  if (allow_special) {
-    for (const std::string& tok : added_sorted_) {
-      std::vector<std::pair<std::string, bool>> next;
-      for (auto& c : chunks) {
-        if (c.second || c.first.find(tok) == std::string::npos) {
-          next.push_back(std::move(c));
-          continue;
-        }
-        const std::string& s = c.first;
-        size_t pos = 0;
-        while (true) {
-          size_t hit = s.find(tok, pos);
-          if (hit == std::string::npos) break;
-          if (hit > pos) next.emplace_back(s.substr(pos, hit - pos), false);
-          next.emplace_back(tok, true);
-          pos = hit + tok.size();
-        }
-        if (pos < s.size()) next.emplace_back(s.substr(pos), false);
-      }
-      chunks = std::move(next);
+// U+FDD0, U+FDD1 and U+FDD2 all encode as EF B7 9x.
+bool is_mark(const std::string& s, size_t i) {
+  return i + 2 < s.size() && static_cast<unsigned char>(s[i]) == 0xEF &&
+         static_cast<unsigned char>(s[i + 1]) == 0xB7 &&
+         static_cast<unsigned char>(s[i + 2]) >= 0x90 &&
+         static_cast<unsigned char>(s[i + 2]) <= 0x92;
+}
+
+}  // namespace
+
+std::string strip_marks(const std::string& text) {
+  std::string out;
+  out.reserve(text.size());
+  for (size_t i = 0; i < text.size();) {
+    if (is_mark(text, i)) {
+      i += 3;
+    } else {
+      out.push_back(text[i++]);
     }
+  }
+  return out;
+}
+
+std::string literal(const std::string& text) {
+  const std::string t = strip_marks(text);
+  return t.empty() ? t : kLiteralOpen + t + kLiteralClose;
+}
+
+std::vector<int> Tokenizer::encode(const std::string& text, bool allow_special) const {
+  // Take the literal markers out, remembering which bytes were inside one. Each
+  // region is normalized on its own; with no markers this is the whole text,
+  // normalized once, as it always was.
+  std::string clean;
+  std::vector<bool> lit;  // per byte of `clean`
+  {
+    bool in = !allow_special;
+    std::string region;
+    auto flush = [&]() {
+      const std::string n = normalize_ ? uni::nfc(region) : region;
+      clean += n;
+      lit.insert(lit.end(), n.size(), in);
+      region.clear();
+    };
+    for (size_t i = 0; i < text.size();) {
+      if (is_mark(text, i)) {
+        const unsigned char m = static_cast<unsigned char>(text[i + 2]);
+        if (m == 0x90 || m == 0x91) {
+          flush();
+          if (allow_special) in = (m == 0x90);
+        }
+        i += 3;  // any other marker is dropped
+        continue;
+      }
+      region.push_back(text[i++]);
+    }
+    flush();
+  }
+
+  // Split out the special tokens; they are matched first and never reach the
+  // BPE -- unless they sit in a literal region, when the piece is kept apart but
+  // encoded as text. Chunks are [a, b) ranges of `clean`.
+  struct Chunk {
+    size_t a, b;
+    int kind;  // 0 text, 1 special token, 2 a special token's text, literally
+  };
+  std::vector<Chunk> chunks{{0, clean.size(), 0}};
+  for (const std::string& tok : added_sorted_) {
+    std::vector<Chunk> next;
+    for (const Chunk& c : chunks) {
+      if (c.kind != 0) {
+        next.push_back(c);
+        continue;
+      }
+      size_t pos = c.a;
+      while (true) {
+        const size_t hit = clean.find(tok, pos);
+        if (hit == std::string::npos || hit + tok.size() > c.b) break;
+        if (hit > pos) next.push_back({pos, hit, 0});
+        bool in_literal = false;
+        for (size_t k = hit; k < hit + tok.size(); ++k) in_literal = in_literal || lit[k];
+        next.push_back({hit, hit + tok.size(), in_literal ? 2 : 1});
+        pos = hit + tok.size();
+      }
+      if (pos < c.b) next.push_back({pos, c.b, 0});
+    }
+    chunks = std::move(next);
   }
 
   std::vector<int> ids;
-  for (const auto& c : chunks) {
-    if (c.second) {
-      ids.push_back(added_.at(c.first));
+  for (const Chunk& c : chunks) {
+    const std::string s = clean.substr(c.a, c.b - c.a);
+    if (c.kind == 1) {
+      ids.push_back(added_.at(s));
       continue;
     }
-    for (const std::string& piece : pretokenize(c.first)) {
+    for (const std::string& piece : pretokenize(s)) {
       std::vector<int> part = bpe(piece);
       ids.insert(ids.end(), part.begin(), part.end());
     }

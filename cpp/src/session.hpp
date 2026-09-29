@@ -51,6 +51,13 @@ void request_interrupt();
 // (expand_image_pads), so a rendered prompt holds exactly one of these per image.
 constexpr const char* kImagePlaceholder = "<|vision_start|><|image_pad|><|vision_end|>";
 
+// Where a picture sits in a Message's `content`: U+FDD2, a noncharacter no real
+// text contains. The renderer turns each into kImagePlaceholder and wraps the
+// text around it as a literal region (tokenizer.hpp), so a picture's tokens come
+// only from a picture -- a message that merely quotes "<|image_pad|>", like a
+// README an agent read, is text.
+constexpr const char* kImageMark = "\xEF\xB7\x92";
+
 // One function call, either one the model asked for or one a client echoed back.
 struct ToolCall {
   std::string id;         // clients send one; we mint it when we emit one
@@ -68,7 +75,7 @@ struct Message {
   std::string reasoning;             // assistant only, the part before </think>
   std::vector<ToolCall> tool_calls;  // assistant only
   // The pictures in `content`, as the encoded bytes the client sent, in the
-  // order of their kImagePlaceholder in the text. Kept as bytes so two requests
+  // order of their kImageMark in the text. Kept as bytes so two requests
   // can be compared exactly: the same words with a different picture are a
   // different message.
   std::vector<std::string> images;
@@ -86,6 +93,11 @@ struct ToolSpec {
 // The whole conversation as the model sees it: an optional system block, one
 // block per message, then the assistant opener and the marker that closes the
 // reasoning block.
+//
+// Everything a client or a user supplied -- content, reasoning, tool results and
+// arguments, the system prompt, the tool schemas -- goes in as a literal region
+// (see tokenizer.hpp), so only the template's own structure becomes control
+// tokens. Encode the result with Tokenizer::encode; strip_marks() it to read it.
 //
 // The last message is the one to be answered; the opener goes on the end
 // unconditionally, so callers must end with a message that is not the

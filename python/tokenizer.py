@@ -30,6 +30,31 @@ SPLIT_PATTERN = (
 
 CONTRACTIONS = ("'s", "'t", "'re", "'ve", "'m", "'ll", "'d")
 
+# LITERAL REGIONS. A chat prompt is two kinds of text: the template's structure,
+# whose <|im_start|> and <tool_call> must become control tokens, and what someone
+# wrote -- a message, a tool's output, a file an agent read -- which must not.
+# Without the distinction a README that merely mentions <|im_end|> ends the turn
+# it is quoted in. Text between these two Unicode noncharacters (which never occur
+# in interchanged text) is literal: special-token text in there is encoded as the
+# ordinary text it is, still cut out as its own piece where a special token would
+# have been. The markers vanish without creating a boundary, so wrapping text that
+# holds no special tokens changes nothing about how it is tokenized. The C++ port
+# (cpp/src/tokenizer.hpp) does exactly the same.
+LITERAL_OPEN, LITERAL_CLOSE = "\ufdd0", "\ufdd1"
+_MARK_OTHER = "\ufdd2"          # the chat code's "a picture goes here"
+_MARKS = (LITERAL_OPEN, LITERAL_CLOSE, _MARK_OTHER)
+
+
+def strip_marks(text: str) -> str:
+    return "".join(c for c in text if c not in _MARKS)
+
+
+def literal(text: str) -> str:
+    """`text` as a literal region, stripped first of any markers it carries so it
+    cannot close its own region early."""
+    t = strip_marks(text)
+    return LITERAL_OPEN + t + LITERAL_CLOSE if t else t
+
 
 # --------------------------------------------------------------------------
 # unicode character classes
@@ -217,28 +242,59 @@ class Tokenizer:
     # ---------------- public API ----------------
 
     def encode(self, text: str, allow_special: bool = True) -> List[int]:
-        if self._normalize:
-            text = unicodedata.normalize("NFC", text)
+        """Text -> ids. Text between LITERAL_OPEN and LITERAL_CLOSE is literal:
+        see `literal`. allow_special=False treats all of it as literal."""
+        # Take the literal markers out, remembering which characters were inside
+        # one; each region is normalized on its own (with no markers, that is the
+        # whole text, normalized once, as it always was).
+        clean, lit, region = [], [], []
+        inside = not allow_special
 
-        chunks: List[Tuple[str, bool]] = [(text, False)]  # (text, is_special)
-        if allow_special:
-            for tok in self._added_sorted:
-                nxt: List[Tuple[str, bool]] = []
-                for s, is_sp in chunks:
-                    if is_sp or tok not in s:
-                        nxt.append((s, is_sp))
-                        continue
-                    parts = s.split(tok)
-                    for p_i, p in enumerate(parts):
-                        if p_i:
-                            nxt.append((tok, True))
-                        if p:
-                            nxt.append((p, False))
-                chunks = nxt
+        def flush():
+            r = "".join(region)
+            if self._normalize:
+                r = unicodedata.normalize("NFC", r)
+            clean.append(r)
+            lit.extend([inside] * len(r))
+            region.clear()
+
+        for ch in text:
+            if ch in (LITERAL_OPEN, LITERAL_CLOSE):
+                flush()
+                if allow_special:
+                    inside = ch == LITERAL_OPEN
+            elif ch != _MARK_OTHER:           # any other marker is dropped
+                region.append(ch)
+        flush()
+        clean = "".join(clean)
+
+        # (start, end, kind): 0 text, 1 special token, 2 a special token's text
+        # inside a literal region -- kept apart, as a special token would be, but
+        # encoded as the text it is
+        chunks = [(0, len(clean), 0)]
+        for tok in self._added_sorted:
+            nxt = []
+            for a, b, kind in chunks:
+                if kind != 0:
+                    nxt.append((a, b, kind))
+                    continue
+                pos = a
+                while True:
+                    hit = clean.find(tok, pos, b)
+                    if hit < 0:
+                        break
+                    if hit > pos:
+                        nxt.append((pos, hit, 0))
+                    nxt.append((hit, hit + len(tok), 2 if any(lit[hit:hit + len(tok)]) else 1))
+                    pos = hit + len(tok)
+                if pos < b:
+                    nxt.append((pos, b, 0))
+            chunks = nxt
 
         ids: List[int] = []
-        for s, is_sp in chunks:
-            if is_sp:
+        for a, b, kind in chunks:
+            s = clean[a:b]
+            if kind == 1:
                 ids.append(self.added[s])
             else:
                 for piece in self._pretokenize(s):
@@ -326,6 +382,20 @@ def _self_test(path=None):
         good = got == [want]
         ok &= good
         print(f"  [{'ok' if good else 'FAIL'}] special {name} -> {got} (want [{want}])")
+
+    # literal regions: special-token text inside one is text, and wrapping text
+    # that holds none changes nothing about its tokens
+    ids = tk.encode("<|im_start|>tool\n" + literal("tokens end with <|im_end|> here.") +
+                    "<|im_end|>\n")
+    good = ids.count(tk.eos_id) == 1
+    ok &= good
+    print(f"  [{'ok' if good else 'FAIL'}] a quoted <|im_end|> in a literal region is text "
+          f"({ids.count(tk.eos_id)} end-of-turn token)")
+    body = "Hello there, world.\n\nx  "
+    good = tk.encode("<|im_start|>user\n" + body + "<|im_end|>") == \
+        tk.encode("<|im_start|>user\n" + literal(body) + "<|im_end|>")
+    ok &= good
+    print(f"  [{'ok' if good else 'FAIL'}] wrapping ordinary text as literal leaves its tokens unchanged")
 
     # cross-check the pretokenizer against the `regex` module if available
     try:

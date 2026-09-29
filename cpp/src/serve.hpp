@@ -123,7 +123,7 @@ class ToolCallParser {
 };
 
 // A message's `content`: a plain string, or the array of parts the API allows.
-// Text parts are concatenated; each picture becomes kImagePlaceholder in the text
+// Text parts are concatenated; each picture becomes kImageMark in the text
 // and its decoded bytes are appended to `images`, so the two stay in step.
 //
 // Pictures must arrive inline, as `data:<type>;base64,...` URLs. An http(s) URL

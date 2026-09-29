@@ -119,6 +119,21 @@ json::Value parse_arguments(const std::string& text) {
   return v.is_obj() ? v : json::Value{};
 }
 
+// A message's content as the template writes it: trimmed, the text as literal
+// regions, each kImageMark replaced by the picture's placeholder.
+std::string render_content(const std::string& content) {
+  const std::string t = trim(content);
+  const std::string mark = kImageMark;
+  std::string out;
+  size_t pos = 0;
+  for (size_t at = t.find(mark); at != std::string::npos; at = t.find(mark, pos)) {
+    out += literal(t.substr(pos, at - pos));
+    out += kImagePlaceholder;
+    pos = at + mark.size();
+  }
+  return out + literal(t.substr(pos));
+}
+
 // What the template writes for one assistant turn's tool calls, in the format it
 // taught the model to use.
 std::string render_tool_calls(const Message& m) {
@@ -132,16 +147,16 @@ std::string render_tool_calls(const Message& m) {
     } else {
       out += "\n<tool_call>\n";
     }
-    out += "<function=" + call.name + ">\n";
+    out += "<function=" + literal(call.name) + ">\n";
     // Values go back exactly as the template would have written them: a string
     // as itself, anything structured as JSON.
     const json::Value args = parse_arguments(call.arguments);
     for (const auto& kv : args.obj) {
-      out += "<parameter=" + kv.first + ">\n";
+      out += "<parameter=" + literal(kv.first) + ">\n";
       if (kv.second.type == json::Type::Str) {
-        out += kv.second.str;
+        out += literal(kv.second.str);
       } else {
-        out += json::dump(kv.second);
+        out += literal(json::dump(kv.second));
       }
       out += "\n</parameter>\n";
     }
@@ -204,17 +219,17 @@ std::string render_chat(const std::vector<Message>& msgs, const std::string& sys
     p += "# Tools\n\nYou have access to the following functions:\n\n<tools>";
     for (const ToolSpec& t : tools) {
       p += "\n";
-      p += t.json;
+      p += literal(t.json);
     }
     p += "\n</tools>";
     for (const char* line : kToolFormatLines) {
       p += "\n";
       p += line;
     }
-    if (!sys.empty()) p += "\n\n" + sys;
+    if (!sys.empty()) p += "\n\n" + literal(sys);
     p += "<|im_end|>\n";
   } else if (!sys.empty()) {
-    p += block("system", sys);
+    p += block("system", literal(sys));
   }
   return p + render_tail(msgs, 0, think);
 }
@@ -234,15 +249,17 @@ std::string render_tail(const std::vector<Message>& msgs, size_t from, bool thin
     if (m.role == "tool") {
       // Consecutive tool results share one user block.
       if (i == 0 || msgs[i - 1].role != "tool") p += "<|im_start|>user";
-      p += "\n<tool_response>\n" + trim(m.content) + "\n</tool_response>";
+      p += "\n<tool_response>\n" + literal(trim(m.content)) + "\n</tool_response>";
       if (i + 1 == msgs.size() || msgs[i + 1].role != "tool") p += "<|im_end|>\n";
       continue;
     }
     // The template trims every message's content; matching it matters, because
     // the tokens are what the KV cache is keyed on.
-    std::string body = trim(m.content);
+    std::string body = render_content(m.content);
     if (m.role == "assistant") {
-      if (i > last_query) body = "<think>\n" + trim(m.reasoning) + "\n</think>\n\n" + body;
+      if (i > last_query) {
+        body = "<think>\n" + literal(trim(m.reasoning)) + "\n</think>\n\n" + body;
+      }
       if (!m.tool_calls.empty()) body += render_tool_calls(m);
     }
     p += block(m.role, body);
@@ -315,8 +332,8 @@ void Session::turn(const std::string& text, bool think, float temp, float top_p,
                    const std::vector<image::Image>& images) {
   Message user;
   user.role = "user";
-  for (size_t i = 0; i < images.size(); ++i) user.content += kImagePlaceholder;
-  user.content += text;
+  for (size_t i = 0; i < images.size(); ++i) user.content += kImageMark;
+  user.content += strip_marks(text);  // typed text cannot place a picture
   turn_prompt(render_chat({user}, turns_ == 0 ? system : std::string(), think), temp,
               top_p, top_k, max_tokens, emit, images);
 }
@@ -333,7 +350,9 @@ void Session::turn_prompt(const std::string& prompt, float temp, float top_p,
   std::vector<ImageFeatures> feats;
   if (images.empty()) {
     if (std::find(ids.begin(), ids.end(), pad) != ids.end()) {
-      throw std::runtime_error("the message contains a literal <|image_pad|> token");
+      // A literal <|image_pad|> in a message is text by now (render_content), so
+      // this is only a caller that wrote a structural one without a picture.
+      throw std::runtime_error("the prompt holds an <|image_pad|> with no picture for it");
     }
   } else {
     std::vector<int> counts;

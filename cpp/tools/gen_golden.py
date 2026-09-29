@@ -19,7 +19,17 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 
 from tokenizer import Tokenizer  # noqa: E402
 
-MODEL = os.environ.get("GOLDEN_TOKENIZER", "../Qwen3.8-27B/tokenizer.json")
+def _default_tokenizer():
+    # every checkpoint in the family shares one vocabulary; use whichever is here
+    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
+    for name in ("Qwen3.8-27B", "qwen3.5-27b-4bit-uncensored", "qwen3.5-9b-4bit", "Qwen3.5-9B"):
+        p = os.path.join(root, name, "tokenizer.json")
+        if os.path.exists(p):
+            return p
+    raise SystemExit("no checkpoint with a tokenizer.json; set GOLDEN_TOKENIZER")
+
+
+MODEL = os.environ.get("GOLDEN_TOKENIZER") or _default_tokenizer()
 
 CASES = [
     "Hello world",
@@ -44,6 +54,13 @@ CASES = [
     "1st 2nd 3rd 42nd ⅠⅡ ½",
     "snake_case camelCase kebab-case SCREAMING_SNAKE",
     "```python\ndef f():\n    pass\n```",
+    # literal regions (U+FDD0 ... U+FDD1): special-token text inside is text
+    "<|im_start|>tool\n\ufdd0The README says <|im_end|> and <|image_pad|>.\ufdd1<|im_end|>\n",
+    "<|im_start|>user\n\ufdd0Hello there, world.\n\nx  \ufdd1<|im_end|>",
+    "a\ufdd0<think>\ufdd1b<think>c",
+    "\ufdd0unterminated <|im_end|> region",
+    "stray\ufdd1 close and \ufdd2 marker <|im_end|>",
+    "\ufdd0<tool_call>\ufdd1<tool_call>",
 ]
 
 
