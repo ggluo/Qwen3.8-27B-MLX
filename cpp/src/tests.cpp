@@ -1156,6 +1156,14 @@ void test_serve_vision(const std::string& path, const std::string& data) {
     }
   };
 
+  // What a continuing request should feed: its new user turn and the assistant
+  // opener, and nothing else -- in particular not the previous reply again,
+  // which the context already holds as the model wrote it.
+  Tokenizer tk(path + "/tokenizer.json");
+  auto tail_tokens = [&](const std::string& user_text) {
+    return static_cast<int>(tk.encode(render_tail({Message("user", user_text)}, 0, false)).size());
+  };
+
   const std::string shapes = read_file(data + "/shapes.png");
   const std::string alpha = read_file(data + "/alpha_text.png");
   const std::string q = "What is written in the image? Answer with exactly what is written.";
@@ -1171,18 +1179,38 @@ void test_serve_vision(const std::string& path, const std::string& data) {
   // 2. the client echoes the history and asks more: the picture is already in the
   //    context, so only the new turn is fed
   const std::string a1 = msg("assistant", jtext(c1));
-  const std::string u2 = msg("user", jtext("What colour is the circle? One word."));
+  const std::string t2 = "What colour is the circle? One word.";
+  const std::string u2 = msg("user", jtext(t2));
   const Reply r2 = http_post(sv[0], chat_body({u1, a1, u2}, 8));
   const std::string c2 = content_of(r2);
   const int p2 = prompt_tokens(r2);
-  check(r2.status == 200 && lower_copy(c2).find("blue") != std::string::npos && p2 > 0 && p2 < 60,
-        "echoed history continues: \"" + brief(c2) + "\", only " + std::to_string(p2) +
-            " new prompt tokens");
+  check(r2.status == 200 && lower_copy(c2).find("blue") != std::string::npos &&
+            p2 == tail_tokens(t2),
+        "echoed history continues: \"" + brief(c2) + "\", " + std::to_string(p2) +
+            " new prompt tokens -- exactly the new turn (" + std::to_string(tail_tokens(t2)) +
+            "), the echoed reply not fed again");
+
+  // ... and again: a third turn in a row feeds only its own turn too
+  const std::string a2 = msg("assistant", jtext(c2));
+  const std::string t3 = "And the square? One word.";
+  const std::string u3a = msg("user", jtext(t3));
+  const Reply r2b = http_post(sv[0], chat_body({u1, a1, u2, a2, u3a}, 8));
+  const std::string c2b = content_of(r2b);
+  check(r2b.status == 200 && lower_copy(c2b).find("red") != std::string::npos &&
+            prompt_tokens(r2b) == tail_tokens(t3),
+        "a third turn continues the same way: \"" + brief(c2b) + "\", " +
+            std::to_string(prompt_tokens(r2b)) + " new prompt tokens");
+
+  // A history that leaves out the reply is not the conversation the context
+  // holds, so it has to start over rather than append after the reply.
+  const Reply r2c = http_post(sv[0], chat_body({u1, u2}, 8));
+  check(r2c.status == 200 && prompt_tokens(r2c) > 300,
+        "a history without the reply starts over: " + std::to_string(prompt_tokens(r2c)) +
+            " prompt tokens");
 
   // 3. the same words about a DIFFERENT picture is a different conversation: it
   //    must not be appended to the cached one
   const std::string u1b = msg("user", "[" + image_part(alpha) + "," + text_part(q) + "]");
-  const std::string a2 = msg("assistant", jtext(c2));
   const std::string u3 = msg("user", jtext("Say OK."));
   const Reply r3 = http_post(sv[0], chat_body({u1b, a1, u2, a2, u3}, 8));
   const int p3 = prompt_tokens(r3);
@@ -1218,13 +1246,14 @@ void test_serve_vision(const std::string& path, const std::string& data) {
 
   // 5. ... and after them the conversation still continues from where it was
   const std::string c3 = content_of(r3);
+  const std::string t5 = "Say OK again.";
   const Reply r5 = http_post(sv[0], chat_body({u1b, a1, u2, a2, u3, msg("assistant", jtext(c3)),
-                                               msg("user", jtext("Say OK again."))},
+                                               msg("user", jtext(t5))},
                                               8));
   const int p5 = prompt_tokens(r5);
-  check(r5.status == 200 && p5 > 0 && p5 < 40,
+  check(r5.status == 200 && p5 == tail_tokens(t5),
         "after the refusals the cached conversation continues: " + std::to_string(p5) +
-            " new prompt tokens");
+            " new prompt tokens, exactly the new turn");
 
   // 6. streaming, with a picture
   const Reply r6 = http_post(

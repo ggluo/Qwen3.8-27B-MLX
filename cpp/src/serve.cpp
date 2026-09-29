@@ -935,7 +935,10 @@ struct Server {
   const Model& model;
 
   Session session;
-  std::vector<Message> held;      // the messages the session's context already covers
+  // the messages the session's context already covers -- INCLUDING the last
+  // reply, as the client will echo it back, so that a continuing request's tail
+  // starts at its new messages rather than feeding that reply a second time
+  std::vector<Message> held;
   std::string held_system;        // ... and the system prompt it covers them with
   std::vector<ToolSpec> held_tools;  // ... and the tools
   bool held_ok = false;           // ... and covers exactly, so a request can extend it
@@ -1069,6 +1072,24 @@ void ModelThread::run() {
   }
 }
 
+// Whether a message the client sent is the one the session's context holds.
+// The pictures count -- the same words about a different picture are a
+// different conversation -- and so do tool calls, by name and arguments: an
+// echoed reply that called something else is not the reply the model wrote.
+// Reasoning does not: clients routinely drop it when they echo a reply, and the
+// context keeps it either way.
+bool same_message(const Message& a, const Message& b) {
+  if (a.role != b.role || a.content != b.content || a.images != b.images) return false;
+  if (a.tool_calls.size() != b.tool_calls.size()) return false;
+  for (size_t i = 0; i < a.tool_calls.size(); ++i) {
+    if (a.tool_calls[i].name != b.tool_calls[i].name ||
+        a.tool_calls[i].arguments != b.tool_calls[i].arguments) {
+      return false;
+    }
+  }
+  return true;
+}
+
 bool Server::handle(const ChatRequest& cr, int fd) {
   const std::string id = new_id("chatcmpl");
   const long long created = time(nullptr);
@@ -1086,12 +1107,7 @@ bool Server::handle(const ChatRequest& cr, int fd) {
   const bool same_head = held_system == cr.system && held_tools == cr.tools;
   const bool append =
       held_ok && same_head && cr.msgs.size() > held.size() &&
-      std::equal(held.begin(), held.end(), cr.msgs.begin(),
-                 [](const Message& a, const Message& b) {
-                   // the pictures too: the same words about a different picture
-                   // are a different conversation
-                   return a.role == b.role && a.content == b.content && a.images == b.images;
-                 });
+      std::equal(held.begin(), held.end(), cr.msgs.begin(), same_message);
   const size_t from = append ? held.size() : 0;
 
   const std::string prompt = append ? render_tail(cr.msgs, held.size(), cr.think)
@@ -1217,6 +1233,13 @@ bool Server::handle(const ChatRequest& cr, int fd) {
     take_calls(tools.feed(text));
   });
 
+  // From here the session advances, so `held` stops describing it until the
+  // reply completes and it is brought up to date below. Anything that ends this
+  // early -- a client that hangs up, Ctrl-C, an exception out of generation --
+  // leaves it untrusted, and the next request starts over rather than appending
+  // to a context that is not what `held` says.
+  held_ok = false;
+
   session.turn_prompt(prompt, cr.temp, cr.top_p, cr.top_k, cr.max_tokens,
                       [&](const std::string& piece) { splitter.feed(piece); }, pictures);
   splitter.finish();
@@ -1232,7 +1255,17 @@ bool Server::handle(const ChatRequest& cr, int fd) {
   const char* finish = !calls.empty()                  ? "tool_calls"
                        : st.n >= cr.max_tokens         ? "length"
                                                        : "stop";
+  // The session's context is now the request's messages plus the reply the model
+  // wrote, closed with <|im_end|>. Record the reply as the assistant message a
+  // client echoes back -- its content, tool calls and reasoning, as sent -- so
+  // the next request's tail begins at whatever follows it.
   held = cr.msgs;
+  Message reply;
+  reply.role = "assistant";
+  reply.content = content;
+  reply.reasoning = reasoning;
+  reply.tool_calls = calls;
+  held.push_back(std::move(reply));
   held_system = cr.system;
   held_tools = cr.tools;
   // A reply cut at a stop sequence leaves the session holding tokens the client

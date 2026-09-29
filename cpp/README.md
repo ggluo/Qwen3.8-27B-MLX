@@ -281,6 +281,19 @@ Four things worth knowing:
   anything else resets and re-prefills. A client that echoes its history back
   pays for that history once, not on every turn. The log line says which
   happened: `continued` or `prefilled`.
+
+  The held conversation includes the **last reply**, recorded as the assistant
+  message the client gets back — content and tool calls, as sent. The context
+  already holds that reply as the model wrote it, so a request that echoes it
+  unchanged feeds only what follows; one that echoes it altered (or leaves it
+  out) is a different conversation and starts over. A reply that ended early —
+  the client hung up, Ctrl-C, a stop string — leaves the context holding tokens
+  the next request cannot account for, so that one starts over too.
+
+  It is all or nothing because of the 48 linear-attention layers: their state
+  is overwritten by every token and cannot be rewound, so there is no reusing
+  the shared part of an edited history the way a pure-attention server can by
+  truncating its KV cache.
 * **One generation at a time.** There is one conversation and one set of caches,
   so a second request queues behind the first — while `/health` and `/v1/models`
   are still answered immediately.
@@ -326,7 +339,7 @@ Four things worth knowing:
 
 ## What is verified
 
-`make test` — 139 checks, all passing (119 of them need no weights at all):
+`make test` — 141 checks, all passing (119 of them need no weights at all):
 
 * **Tokenizer ids are identical to the Python implementation** on 22 cases
   covering contractions, CJK, emoji, combining accents, tabs/CRLF, code fences,
@@ -372,9 +385,11 @@ Four things worth knowing:
   context.
 * **Serve mode takes pictures over its real HTTP path**, driven through a
   `socketpair()` — a test cannot bind a port, but a socket pair needs no network:
-  a picture cold, an echoed history that continues from the cache, a swapped
-  picture that must *not*, every refusal as a `400` with the cached conversation
-  still intact after it, and a streamed reply.
+  a picture cold; an echoed history that continues from the cache, feeding
+  *exactly* the new turn's tokens and not the echoed reply again, two turns in
+  a row; a history that leaves out the reply, and a swapped picture, both of
+  which must start over; every refusal as a `400` with the cached conversation
+  still intact after it; and a streamed reply.
 
 Beyond the suite, the port was checked against the Python end to end: **greedy
 output is byte-identical** between the two, for text and for pictures alike —
