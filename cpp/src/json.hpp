@@ -44,4 +44,10 @@ struct Value {
 Value parse(const std::string& text);
 Value parse_file(const std::string& path);
 
+// Back out to text, compactly and in insertion order. Serve mode needs it: a
+// request's tool schemas and a model's tool arguments arrive as JSON and have to
+// go into the prompt as JSON. Numbers come back as the shortest form that reads
+// as the same double, so an integer does not come back as "1.000000".
+std::string dump(const Value& v);
+
 }  // namespace json

@@ -4,6 +4,7 @@
 //     ./ai --think                # show the model's reasoning
 //     ./ai --system "Be terse."
 //     ./ai --prompt "..." -n 200  # one-shot, non-interactive
+//     ./ai --serve                # OpenAI-compatible API on 127.0.0.1:8080
 //
 // Everything lives in memory: the conversation, the KV cache, the editing
 // history. Quit and it is gone. No files are created, and none are read except
@@ -22,6 +23,7 @@
 
 #include "lineread.hpp"
 #include "model.hpp"
+#include "serve.hpp"
 #include "session.hpp"
 #include "tokenizer.hpp"
 
@@ -54,6 +56,11 @@ bool is_dir(const std::string& p) {
 std::string dirname_of(const std::string& p) {
   size_t s = p.rfind('/');
   return s == std::string::npos ? "." : p.substr(0, s);
+}
+
+std::string basename_of(const std::string& p) {
+  size_t s = p.rfind('/');
+  return s == std::string::npos ? p : p.substr(s + 1);
 }
 
 // Resolve the model relative to the binary, not the cwd, so a launcher on PATH
@@ -119,7 +126,7 @@ class ThinkStyler {
 };
 
 struct Args {
-  std::string model = "qwen3.5-27b-4bit-uncensored";
+  std::string model = "/Users/gluo/Documents/Qwen3.8-27B-MLX/qwen3.5-9b-4bit-uncensored";
   std::string system;
   std::string prompt;  // non-empty => one-shot mode
   bool think = false;
@@ -129,6 +136,14 @@ struct Args {
   int top_k = 20;
   int draft = 3;
   int max_tokens = 1024;
+
+  // serve mode
+  bool serve = false;
+  std::string host = "127.0.0.1";
+  int port = 8080;
+  std::string api_key;
+  std::string model_name;  // defaults to the model directory's own name
+  std::string dump_dir;    // non-empty => write every request and reply there
 };
 
 Args parse_args(int argc, char** argv) {
@@ -152,10 +167,18 @@ Args parse_args(int argc, char** argv) {
     else if (f == "--top-k") a.top_k = atoi(next().c_str());
     else if (f == "-k" || f == "--draft") a.draft = atoi(next().c_str());
     else if (f == "-n" || f == "--max-tokens") a.max_tokens = atoi(next().c_str());
+    else if (f == "--serve") a.serve = true;
+    else if (f == "--host") a.host = next();
+    else if (f == "--port") a.port = atoi(next().c_str());
+    else if (f == "--api-key") a.api_key = next();
+    else if (f == "--model-name") a.model_name = next();
+    else if (f == "--dump") a.dump_dir = next();
     else if (f == "-h" || f == "--help") {
       printf("usage: ai [--model DIR] [--system TEXT] [--think] [--temp F]\n"
              "          [--top-p F] [--top-k N] [-k N] [--no-spec] [-n N]\n"
-             "          [--prompt TEXT]\n%s",
+             "          [--prompt TEXT]\n"
+             "       ai --serve [--host IP] [--port N] [--api-key KEY]\n"
+             "          [--model-name NAME] [--dump DIR]\n%s",
              kHelp);
       exit(0);
     } else {
@@ -223,6 +246,24 @@ void generate(Session& s, const std::string& text, bool think, const Args& a,
 int main(int argc, char** argv) {
   Args a = parse_args(argc, argv);
   const std::string path = resolve_model(a.model, argv[0]);
+
+  // Serve mode takes over the process before any of the terminal machinery is
+  // set up; it never reads the keyboard and never writes a reply to stdout. It
+  // loads the model itself, on the thread that will run it -- see serve.cpp.
+  if (a.serve) {
+    ServeOptions opt;
+    opt.host = a.host;
+    opt.port = a.port;
+    opt.api_key = a.api_key;
+    opt.model_name = a.model_name.empty() ? basename_of(path) : a.model_name;
+    opt.system = a.system;
+    opt.think = a.think;
+    opt.spec = !a.no_spec;
+    opt.draft = a.draft;
+    opt.dump_dir = a.dump_dir;
+    serve(path, opt);
+    return 0;  // unreachable: serve() exits
+  }
 
   const auto t0 = std::chrono::steady_clock::now();
   fprintf(stderr, "loading %s ...\n", a.model.c_str());

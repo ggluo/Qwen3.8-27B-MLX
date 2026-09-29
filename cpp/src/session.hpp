@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <functional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "model.hpp"
@@ -19,6 +20,7 @@
 
 struct Stats {
   int n = 0;         // tokens emitted
+  int prompt_n = 0;  // tokens consumed as the prompt
   int rounds = 0;    // target passes (speculative only)
   int drafted = 0;
   int accepted = 0;
@@ -31,6 +33,77 @@ struct Stats {
 bool take_interrupt();
 void install_interrupt_handler();
 bool interrupt_pending();
+// Asks a running decode loop to stop at the next round boundary, the same way
+// SIGINT does. Async-signal-safe, so a signal handler other than the one above
+// may call it -- serve mode's does, so that Ctrl-C both stops the reply in
+// flight and shuts the server down.
+void request_interrupt();
+
+// ---------------------------------------------------------------------------
+// the chat template
+// ---------------------------------------------------------------------------
+
+// One function call, either one the model asked for or one a client echoed back.
+struct ToolCall {
+  std::string id;         // clients send one; we mint it when we emit one
+  std::string name;
+  std::string arguments;  // a JSON object, as text
+};
+
+// One message of a chat, content already flattened to text.
+struct Message {
+  Message() = default;
+  Message(std::string r, std::string c) : role(std::move(r)), content(std::move(c)) {}
+
+  std::string role;  // system | user | assistant | tool
+  std::string content;
+  std::string reasoning;             // assistant only, the part before </think>
+  std::vector<ToolCall> tool_calls;  // assistant only
+};
+
+// One entry of a request's `tools` array, already back out as JSON text. The
+// template prints these verbatim into the prompt, so the text has to be stable
+// from request to request or the KV cache cannot be reused.
+struct ToolSpec {
+  std::string json;
+
+  bool operator==(const ToolSpec& other) const { return json == other.json; }
+};
+
+// The whole conversation as the model sees it: an optional system block, one
+// block per message, then the assistant opener and the marker that closes the
+// reasoning block.
+//
+// The last message is the one to be answered; the opener goes on the end
+// unconditionally, so callers must end with a message that is not the
+// assistant's.
+//
+// `tools` puts the checkpoint's own function-calling preamble, and the schemas,
+// at the head of the system block -- the model was trained on exactly that text,
+// so it is not ours to rephrase. `system` is the whole system turn; a request's
+// system message belongs there rather than in `msgs`.
+std::string render_chat(const std::vector<Message>& msgs, const std::string& system,
+                        bool think, const std::vector<ToolSpec>& tools = {});
+
+// The tail of that string, covering msgs[from..] and the opener. A session that
+// closed its last turn with <|im_end|>\n already holds everything before `from`,
+// so feeding it this one string continues the chat in the place -- and in the
+// order -- render_chat() would have put it.
+//
+// The tools are not re-rendered: they live in the head, which is already there.
+//
+// `render_tail(msgs, 0, think)` is `render_chat(msgs, "", think)`.
+std::string render_tail(const std::vector<Message>& msgs, size_t from, bool think);
+
+// The renderers above are this model family's chat template, written out in C++
+// rather than interpreted -- the real one is a Jinja file, and running it would
+// mean carrying a Jinja engine. So a checkpoint that brought a different
+// template would be prompted in a format it was not trained on, silently.
+//
+// This reads the checkpoint's template (its text, from chat_template.jinja or
+// tokenizer_config.json) and returns what is wrong with it, or "" when it is the
+// template these renderers implement.
+std::string template_mismatch(const std::string& chat_template);
 
 class Session {
  public:
@@ -48,6 +121,13 @@ class Session {
   void turn(const std::string& text, bool think, float temp, float top_p, int top_k,
             int max_tokens, const std::function<void(const std::string&)>& emit);
 
+  // The same, with the caller supplying the prompt text. `turn()` is this plus
+  // render_chat() on one user message; serve mode renders a whole chat from the
+  // request's messages, so it comes through here instead. `system` is not
+  // consulted -- whatever is in the prompt is what the model sees.
+  void turn_prompt(const std::string& prompt, float temp, float top_p, int top_k,
+                   int max_tokens, const std::function<void(const std::string&)>& emit);
+
   const Stats& last() const { return last_; }
   size_t context_tokens() const { return tokens_.size(); }
   bool speculative() const { return spec_; }
@@ -55,7 +135,6 @@ class Session {
   std::string system;
 
  private:
-  std::vector<int> prompt_tokens(const std::string& text, bool think) const;
   // Feeds everything the model has not seen yet; returns the last hidden state.
   mx::array sync();
   bool is_eos(int t) const { return t == tk_.eos_id || t == tk_.bos_id; }

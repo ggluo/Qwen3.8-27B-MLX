@@ -111,6 +111,7 @@ delivers what static linking would actually have bought here.
 ./build/ai --temp 0 -k 4                     # greedy, draft 4 tokens per round
 ./build/ai --no-spec                         # plain decoding, no MTP drafting
 ./build/ai --prompt "..." -n 200             # one-shot, non-interactive
+./build/ai --serve                           # OpenAI-compatible API on 127.0.0.1:8080
 ```
 
 In-chat commands: `/help` `/new` `/think` `/temp` `/system` `/paste` `/stats`
@@ -126,6 +127,113 @@ all live in memory and die with the process.
 `./ai` is a launcher you can symlink onto `PATH`; the binary resolves the model
 directory relative to itself, so it works from any working directory.
 
+## Serve mode
+
+`--serve` puts the same assistant behind an HTTP endpoint speaking the OpenAI
+chat-completions API — the field names, the SSE framing, the error shape — so
+anything that already talks to vLLM, llama.cpp or Ollama can talk to this binary
+without an adapter.
+
+```
+./build/ai --serve --port 8080
+curl -s http://127.0.0.1:8080/v1/chat/completions \
+     -H 'Content-Type: application/json' \
+     -d '{"messages":[{"role":"user","content":"Why is the sky blue?"}],"stream":true}'
+```
+
+| Route | |
+| --- | --- |
+| `POST /v1/chat/completions` | The API. `stream`, `temperature`, `top_p`, `top_k`, `max_tokens`/`max_completion_tokens`, `stop` and `stream_options.include_usage` are honoured. `think: true` (or the Qwen templates' `chat_template_kwargs.enable_thinking`) reports the reasoning block as `reasoning_content`, the way DeepSeek-style clients expect |
+| `GET /v1/models` | The one model, named after its directory; `--model-name` overrides |
+| `GET /health` | `{"status":"ok"}`, answered without waking the model, so it stays fast while a reply is being written |
+
+**Tool calls work**, which is what an agentic client needs. The schemas go into
+the prompt exactly as the checkpoint's template writes them, `<tool_call>`
+blocks come back out as OpenAI `tool_calls` — streamed and whole, with arguments
+that follow the declared types — a call's `finish_reason` is `tool_calls`, and
+`role: "tool"` results are rendered back as `<tool_response>` blocks so the loop
+can continue. So an agent like opencode can drive it:
+
+```
+curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "messages": [{"role": "user", "content": "List the files in /tmp with a tool."}],
+  "tools": [{"type": "function", "function": {"name": "bash", "description": "Run a command",
+             "parameters": {"type": "object", "properties": {"command": {"type": "string"}},
+                            "required": ["command"]}}}]}'
+
+Also `--host` (default `127.0.0.1`: this is a local model, and the default keeps
+it local), `--api-key` (requires `Authorization: Bearer <key>`; `/health` stays
+open), plus the same `--system`, `--think`, `-k`, `--no-spec` and `-n` knobs the
+REPL takes, as defaults for requests that do not ask.
+
+### Seeing what a client actually sends
+
+`--dump DIR` writes every request and reply there as they happen, numbered in
+arrival order — the same order as the log lines:
+
+| File | |
+| --- | --- |
+| `NNNN-request.json` | the request body, verbatim |
+| `NNNN-prompt.txt` | the exact text handed to the model, when the request was rendered from scratch: the whole conversation, system prompt and tool schemas included |
+| `NNNN-prompt-tail.txt` | the same, when the request only extended a conversation the session was already holding. That prompt really is only the new turns — everything before it is already in the KV cache — and the file is named so that half a conversation cannot be mistaken for a whole prompt |
+| `NNNN-response.json` | the reply — content, reasoning, tool calls — with its timings, and `prompt`: what this request's prompt was made of |
+
+`prompt` in the response is what the breakdown has to be read as:
+
+```json
+"prompt": {
+  "head_in_context": true,        // system prompt + tools already in the cache
+  "system_bytes": 56048,          // bytes, not characters: these prompts are
+  "tools_bytes": 13150,           //   full of emoji and CJK
+  "reused_tokens": 17070,         // tokens the session already held
+  "messages": [                   // only the messages this prompt carried
+    {"role": "assistant", "content_bytes": 2938},
+    {"role": "user", "content_bytes": 29}
+  ]
+}
+```
+
+`reused_tokens` plus `usage.prompt_tokens` is the context the next turn starts
+from, which is how you check the cache is doing what it claims.
+
+That breakdown is how you answer "why is this prompt 17k tokens long": a prompt
+that size is almost always the client's own doing — an agent's instructions, the
+environment block, its tool schemas, whatever it pasted in from the repository.
+Requests that were refused are dumped too, which is usually the quickest way to
+see why a client is unhappy.
+
+This is the one thing in this binary that writes a conversation to disk, and it
+only happens when asked. The directory is created mode 0700.
+
+Four things worth knowing:
+
+* **The KV cache is reused across requests.** A request whose `messages` extend
+  the conversation the server is already holding appends only the new turns;
+  anything else resets and re-prefills. A client that echoes its history back
+  pays for that history once, not on every turn. The log line says which
+  happened: `continued` or `prefilled`.
+* **One generation at a time.** There is one conversation and one set of caches,
+  so a second request queues behind the first — while `/health` and `/v1/models`
+  are still answered immediately.
+* **One thread owns the model.** MLX ties every array to the stream of the
+  thread that created it, so the weights are loaded by, and only ever touched
+  by, a single thread; connection threads hand it one request at a time. Loading
+  on one thread and generating on another fails with `There is no Stream(gpu, N)
+  in current thread` — which is exactly what a thread-per-request server does by
+  accident.
+* **The prompt is the checkpoint's chat template, written out in C++.** The real
+  one is a Jinja file, and interpreting it would mean shipping a Jinja engine, so
+  serve mode reads `<model>/chat_template.jinja` at load and checks it against
+  the format these renderers write — the tools preamble, the `<function=...>` /
+  `<parameter=...>` call body, the `<tool_response>` block. A checkpoint whose
+  template says something else is reported at startup rather than prompted in a
+  format it was never trained on. That file is the specification for
+  `session.cpp`, and for checkpoints in this family it is byte-identical to the
+  copy in `tokenizer_config.json`.
+* **No CORS and no TLS.** This is the same in-memory assistant behind a socket,
+  not a deployment: it writes nothing to disk, and nothing is exposed beyond
+  loopback unless `--host` says so.
+
 ## Layout
 
 | File | What it is |
@@ -140,12 +248,13 @@ directory relative to itself, so it works from any working directory.
 | `src/json.{hpp,cpp}` | Minimal JSON reader for `config.json` and the 12.8 MB `tokenizer.json` |
 | `src/lineread.{hpp,cpp}` | Raw-mode line reader with correct multi-line paste handling |
 | `src/ops.{hpp,cpp}` | Small array helpers (`slice_axis`, `silu`, `softplus`, `l2norm`) |
+| `src/serve.{hpp,cpp}` | Serve mode: the HTTP/1.1 server, the OpenAI routes, and the one thread that owns the model |
 | `src/main.cpp` | Argument parsing, the REPL, reasoning-block dimming |
 | `src/tests.cpp` | Self-tests |
 
 ## What is verified
 
-`make test` — 46 checks, all passing:
+`make test` — 101 checks, all passing (90 of them need no weights at all):
 
 * **Tokenizer ids are identical to the Python implementation** on 22 cases
   covering contractions, CJK, emoji, combining accents, tabs/CRLF, code fences,
@@ -165,6 +274,19 @@ directory relative to itself, so it works from any working directory.
 * **Segmented prefill equals a single forward pass** (same argmax; every layer's
   cache lands on the same offset). All cache reuse across turns rests on this.
 * **Speculative decoding equals plain decoding** at temp 0, token for token.
+* **The chat template and the HTTP layer are pinned too.** The renderer is
+  checked against literal template strings, including the property serve mode's
+  cache reuse rests on — that a continuation is the *suffix* of a full render,
+  so appending it lands where a cold render would have put it. The request
+  parser is checked on keep-alive, LF-only line endings and half-arrived input;
+  the stop filter on stop strings split across pieces, and on characters split
+  across pieces, which is what a byte-level BPE token can do to a JSON string.
+* **Tool calls are pinned at every step**: the preamble and the format the model
+  was taught, a call echoed back into the history, a tool result as a user block,
+  consecutive results sharing one, and — on the way out — a call read back out of
+  the model's text, including when the tags themselves are split across pieces,
+  when the arguments have to be typed as the schema declares, and when a
+  `<tool_call>` turns out to be prose after all.
 
 Beyond the suite, the port was checked against the Python end to end: **120 greedy
 tokens on a code prompt are byte-identical** between the two implementations.

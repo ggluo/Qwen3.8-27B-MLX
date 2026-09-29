@@ -243,6 +243,82 @@ Value parse(const std::string& text) {
   return v;
 }
 
+namespace {
+
+void write(const Value& v, std::string& out);
+
+void write_number(double d, std::string& out) {
+  char buf[40];
+  if (d == static_cast<double>(static_cast<long long>(d))) {
+    snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(d));
+  } else {
+    // The shortest of two fixed precisions that reads back as the same double:
+    // 17 digits always round-trips, but it turns 0.1 into 0.10000000000000001.
+    snprintf(buf, sizeof(buf), "%.6g", d);
+    if (strtod(buf, nullptr) != d) snprintf(buf, sizeof(buf), "%.17g", d);
+  }
+  out += buf;
+}
+
+void write_string(const std::string& s, std::string& out) {
+  out += '"';
+  for (unsigned char c : s) {
+    switch (c) {
+      case '"': out += "\\\""; break;
+      case '\\': out += "\\\\"; break;
+      case '\n': out += "\\n"; break;
+      case '\r': out += "\\r"; break;
+      case '\t': out += "\\t"; break;
+      case '\b': out += "\\b"; break;
+      case '\f': out += "\\f"; break;
+      default:
+        if (c < 0x20) {
+          char esc[8];
+          snprintf(esc, sizeof(esc), "\\u%04x", c);
+          out += esc;
+        } else {
+          out += static_cast<char>(c);
+        }
+    }
+  }
+  out += '"';
+}
+
+void write(const Value& v, std::string& out) {
+  switch (v.type) {
+    case Type::Null: out += "null"; break;
+    case Type::Bool: out += v.boolean ? "true" : "false"; break;
+    case Type::Num: write_number(v.num, out); break;
+    case Type::Str: write_string(v.str, out); break;
+    case Type::Arr:
+      out += '[';
+      for (size_t i = 0; i < v.arr.size(); ++i) {
+        if (i) out += ',';
+        write(v.arr[i], out);
+      }
+      out += ']';
+      break;
+    case Type::Obj:
+      out += '{';
+      for (size_t i = 0; i < v.obj.size(); ++i) {
+        if (i) out += ',';
+        write_string(v.obj[i].first, out);
+        out += ':';
+        write(v.obj[i].second, out);
+      }
+      out += '}';
+      break;
+  }
+}
+
+}  // namespace
+
+std::string dump(const Value& v) {
+  std::string out;
+  write(v, out);
+  return out;
+}
+
 Value parse_file(const std::string& path) {
   FILE* f = fopen(path.c_str(), "rb");
   if (!f) {

@@ -1,8 +1,12 @@
 #include "session.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <csignal>
+#include <cstring>
+#include <stdexcept>
 
+#include "json.hpp"
 #include "ops.hpp"
 #include "sample.hpp"
 
@@ -37,7 +41,218 @@ mx::array last_step(const mx::array& x) {
 // The replacement character, i.e. "this token sequence ends mid-codepoint".
 const char* kReplacement = "\xEF\xBF\xBD";
 
+// One `<|im_start|>role\ncontent<|im_end|>\n` block. The closing newline matters:
+// every block is followed by the next one, and the template never puts anything
+// else between them.
+std::string block(const std::string& role, const std::string& content) {
+  return "<|im_start|>" + role + "\n" + content + "<|im_end|>\n";
+}
+
 }  // namespace
+
+namespace {
+
+// The function-calling preamble, verbatim from the checkpoint's chat template.
+// The model was trained on this exact wording, so it is not ours to rephrase.
+// The two empty lines at the front are the blank line the template puts before
+// "If you choose to call a function" and the one before that.
+const char* const kToolFormatLines[] = {
+    "",
+    "",
+    "If you choose to call a function ONLY reply in the following format with NO suffix:",
+    "",
+    "<tool_call>",
+    "<function=example_function_name>",
+    "<parameter=example_parameter_1>",
+    "value_1",
+    "</parameter>",
+    "<parameter=example_parameter_2>",
+    "This is the value for the second parameter",
+    "that can span",
+    "multiple lines",
+    "</parameter>",
+    "</function>",
+    "</tool_call>",
+    "",
+    "<IMPORTANT>",
+    "Reminder:",
+    "- Function calls MUST follow the specified format: an inner <function=...></function> "
+    "block must be nested within <tool_call></tool_call> XML tags",
+    "- Required parameters MUST be specified",
+    "- You may provide optional reasoning for your function call in natural language BEFORE "
+    "the function call, but NOT after",
+    "- If there is no function call available, answer the question like normal with your "
+    "current knowledge and do not tell the user about function calls",
+    "</IMPORTANT>",
+};
+
+// A tool result, which the template renders inside a user block. Trailing
+// whitespace is not trimmed: the template does not, and a client's history is
+// compared against its own previous request to decide on cache reuse.
+bool is_tool_response(const std::string& content) {
+  const size_t a = content.find_first_not_of(" \t\r\n");
+  if (a == std::string::npos) return false;
+  const std::string s = content.substr(a);
+  return s.rfind("<tool_response>", 0) == 0 &&
+         s.size() >= strlen("</tool_response>") &&
+         s.compare(s.size() - strlen("</tool_response>"), strlen("</tool_response>"),
+                   "</tool_response>") == 0;
+}
+
+std::string trim(const std::string& s) {
+  const size_t a = s.find_first_not_of(" \t\r\n");
+  if (a == std::string::npos) return "";
+  const size_t b = s.find_last_not_of(" \t\r\n");
+  return s.substr(a, b - a + 1);
+}
+
+// The arguments a client echoed, reparsed so that each parameter can go back
+// into the template's <parameter=> lines. Anything that is not a JSON object
+// leaves the call with no parameters, which is all a malformed echo deserves.
+json::Value parse_arguments(const std::string& text) {
+  json::Value v;
+  try {
+    v = json::parse(text);
+  } catch (const std::exception&) {
+    return json::Value{};
+  }
+  return v.is_obj() ? v : json::Value{};
+}
+
+// What the template writes for one assistant turn's tool calls, in the format it
+// taught the model to use.
+std::string render_tool_calls(const Message& m) {
+  std::string out;
+  for (size_t c = 0; c < m.tool_calls.size(); ++c) {
+    const ToolCall& call = m.tool_calls[c];
+    if (c == 0 && trim(m.content).empty()) {
+      out += "<tool_call>\n";
+    } else if (c == 0) {
+      out += "\n\n<tool_call>\n";
+    } else {
+      out += "\n<tool_call>\n";
+    }
+    out += "<function=" + call.name + ">\n";
+    // Values go back exactly as the template would have written them: a string
+    // as itself, anything structured as JSON.
+    const json::Value args = parse_arguments(call.arguments);
+    for (const auto& kv : args.obj) {
+      out += "<parameter=" + kv.first + ">\n";
+      if (kv.second.type == json::Type::Str) {
+        out += kv.second.str;
+      } else {
+        out += json::dump(kv.second);
+      }
+      out += "\n</parameter>\n";
+    }
+    out += "</function>\n</tool_call>";
+  }
+  return out;
+}
+
+}  // namespace
+
+std::string template_mismatch(const std::string& chat_template) {
+  if (chat_template.empty()) {
+    return "the checkpoint carries no chat template, so the prompt cannot be checked "
+           "against one";
+  }
+  // The template's own text has to carry these; each is what one part of the
+  // renderer stands in for.
+  struct Marker {
+    const char* text;
+    const char* part;
+  };
+  static const Marker kCore[] = {
+      {"<|im_start|>", "<|im_start|> turn markers"},
+      {"<|im_end|>", "<|im_end|> turn markers"},
+  };
+  static const Marker kTools[] = {
+      {"# Tools", "a tools preamble"},
+      {"<tool_call>", "tool_call tags"},
+      {"<function=", "a <function=...> call body"},
+      {"<parameter=", "<parameter=...> arguments"},
+      {"<tool_response>", "a tool_response result block"},
+  };
+  for (const Marker& m : kCore) {
+    if (chat_template.find(m.text) == std::string::npos) {
+      return std::string("the checkpoint's chat template has no ") + m.part +
+             ", which is the format these renderers write; prompts would not be what "
+             "the model was trained on";
+    }
+  }
+  std::string missing;
+  for (const Marker& m : kTools) {
+    if (chat_template.find(m.text) == std::string::npos) {
+      if (!missing.empty()) missing += ", ";
+      missing += m.part;
+    }
+  }
+  if (!missing.empty()) {
+    return "the checkpoint's chat template has no " + missing +
+           "; requests that pass tools cannot be rendered the way the model expects";
+  }
+  return "";
+}
+
+std::string render_chat(const std::vector<Message>& msgs, const std::string& system,
+                        bool think, const std::vector<ToolSpec>& tools) {
+  const std::string sys = trim(system);
+  std::string p;
+  if (!tools.empty()) {
+    p += "<|im_start|>system\n";
+    p += "# Tools\n\nYou have access to the following functions:\n\n<tools>";
+    for (const ToolSpec& t : tools) {
+      p += "\n";
+      p += t.json;
+    }
+    p += "\n</tools>";
+    for (const char* line : kToolFormatLines) {
+      p += "\n";
+      p += line;
+    }
+    if (!sys.empty()) p += "\n\n" + sys;
+    p += "<|im_end|>\n";
+  } else if (!sys.empty()) {
+    p += block("system", sys);
+  }
+  return p + render_tail(msgs, 0, think);
+}
+
+std::string render_tail(const std::vector<Message>& msgs, size_t from, bool think) {
+  // The template only wraps an assistant turn in a reasoning block when that
+  // turn comes after the last real user query -- the turn being continued, not
+  // one replayed from the history.
+  size_t last_query = msgs.size();
+  for (size_t i = 0; i < msgs.size(); ++i) {
+    if (msgs[i].role == "user" && !is_tool_response(msgs[i].content)) last_query = i;
+  }
+
+  std::string p;
+  for (size_t i = from; i < msgs.size(); ++i) {
+    const Message& m = msgs[i];
+    if (m.role == "tool") {
+      // Consecutive tool results share one user block.
+      if (i == 0 || msgs[i - 1].role != "tool") p += "<|im_start|>user";
+      p += "\n<tool_response>\n" + trim(m.content) + "\n</tool_response>";
+      if (i + 1 == msgs.size() || msgs[i + 1].role != "tool") p += "<|im_end|>\n";
+      continue;
+    }
+    // The template trims every message's content; matching it matters, because
+    // the tokens are what the KV cache is keyed on.
+    std::string body = trim(m.content);
+    if (m.role == "assistant") {
+      if (i > last_query) body = "<think>\n" + trim(m.reasoning) + "\n</think>\n\n" + body;
+      if (!m.tool_calls.empty()) body += render_tool_calls(m);
+    }
+    p += block(m.role, body);
+  }
+  p += "<|im_start|>assistant\n";
+  // The template always opens a reasoning block; closing it immediately is how
+  // you disable thinking.
+  p += think ? "<think>\n" : "<think>\n\n</think>\n\n";
+  return p;
+}
 
 void install_interrupt_handler() {
   struct sigaction sa {};
@@ -55,6 +270,8 @@ bool take_interrupt() {
   return was;
 }
 
+void request_interrupt() { g_interrupt = 1; }
+
 Session::Session(const Model& model, const Tokenizer& tk, std::string system,
                  bool spec, int draft_k, int prefill_step)
     : system(std::move(system)),
@@ -71,18 +288,6 @@ void Session::reset() {
   cache_ = model_.make_cache();
   turns_ = 0;
   mx::clear_cache();
-}
-
-std::vector<int> Session::prompt_tokens(const std::string& text, bool think) const {
-  std::string p;
-  if (turns_ == 0 && !system.empty()) {
-    p += "<|im_start|>system\n" + system + "<|im_end|>\n";
-  }
-  p += "<|im_start|>user\n" + text + "<|im_end|>\n<|im_start|>assistant\n";
-  // The template always opens a reasoning block; closing it immediately is how
-  // you disable thinking.
-  p += think ? "<think>\n" : "<think>\n\n</think>\n\n";
-  return tk_.encode(p);
 }
 
 mx::array Session::sync() {
@@ -109,11 +314,23 @@ void Session::close_turn() {
 void Session::turn(const std::string& text, bool think, float temp, float top_p,
                    int top_k, int max_tokens,
                    const std::function<void(const std::string&)>& emit) {
-  std::vector<int> prompt = prompt_tokens(text, think);
-  tokens_.insert(tokens_.end(), prompt.begin(), prompt.end());
+  Message user;
+  user.role = "user";
+  user.content = text;
+  turn_prompt(render_chat({user}, turns_ == 0 ? system : std::string(), think), temp,
+              top_p, top_k, max_tokens, emit);
+}
+
+void Session::turn_prompt(const std::string& prompt, float temp, float top_p,
+                          int top_k, int max_tokens,
+                          const std::function<void(const std::string&)>& emit) {
+  const size_t before = tokens_.size();
+  std::vector<int> ids = tk_.encode(prompt);
+  tokens_.insert(tokens_.end(), ids.begin(), ids.end());
 
   const double t0 = now_s();
   last_ = Stats{};
+  last_.prompt_n = static_cast<int>(tokens_.size() - before);
 
   mx::array h = sync();
   int first = sample::sample_probs(

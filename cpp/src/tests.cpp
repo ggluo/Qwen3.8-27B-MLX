@@ -14,12 +14,14 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <string>
 #include <vector>
 
 #include "delta.hpp"
 #include "lineread.hpp"
 #include "model.hpp"
+#include "serve.hpp"
 #include "session.hpp"
 #include "ops.hpp"
 #include "sample.hpp"
@@ -46,6 +48,17 @@ void check(bool ok, const std::string& what) {
   } else {
     ++g_fail;
   }
+}
+
+// True if `f` throws -- for the paths that have to refuse input rather than
+// answer it.
+bool throws(const std::function<void()>& f) {
+  try {
+    f();
+  } catch (const std::exception&) {
+    return true;
+  }
+  return false;
 }
 
 struct GoldenCase {
@@ -421,6 +434,236 @@ int lineread_child() {
   return 0;
 }
 
+// ---------------------------------------------------------------------------
+// the chat template and the HTTP layer behind serve mode
+// ---------------------------------------------------------------------------
+
+const char* kOpener = "<|im_start|>assistant\n";
+const char* kNoThink = "<think>\n\n</think>\n\n";
+const char* kThink = "<think>\n";
+
+std::string blk(const char* role, const std::string& text) {
+  return std::string("<|im_start|>") + role + "\n" + text + "<|im_end|>\n";
+}
+
+void test_template() {
+  printf("\nthe chat template\n");
+  const std::vector<Message> one{{"user", "hi"}};
+  check(render_chat(one, "", false) == blk("user", "hi") + kOpener + kNoThink,
+        "one user turn, thinking off");
+  check(render_chat(one, "", true) == blk("user", "hi") + kOpener + kThink,
+        "... and thinking on");
+  check(render_chat(one, "Be terse.", false) ==
+            blk("system", "Be terse.") + blk("user", "hi") + kOpener + kNoThink,
+        "the system prompt leads the conversation");
+
+  const std::vector<Message> chat{
+      {"system", "s"}, {"user", "u1"}, {"assistant", "a1"}, {"user", "u2"}};
+  const std::string full = render_chat(chat, "", false);
+  check(full == blk("system", "s") + blk("user", "u1") + blk("assistant", "a1") +
+                    blk("user", "u2") + kOpener + kNoThink,
+        "a whole conversation, in order");
+  check(render_tail(chat, 0, false) == full, "the tail from 0 is the whole render");
+  check(render_tail(chat, 3, false) == blk("user", "u2") + kOpener + kNoThink,
+        "the tail for the next turn is that turn alone");
+
+  // What the KV-cache reuse in serve mode rests on: a session that already holds
+  // the head of a conversation is fed the tail, so the tail has to be exactly
+  // what a cold render would have put after that head.
+  bool suffix = true;
+  for (size_t k = 0; k < chat.size(); ++k) {
+    const std::string tail = render_tail(chat, k, false);
+    suffix = suffix && full.size() >= tail.size() &&
+             full.compare(full.size() - tail.size(), tail.size(), tail) == 0;
+  }
+  check(suffix, "every tail is a suffix of the whole render");
+}
+
+void test_http() {
+  printf("\nhttp\n");
+  HttpRequest r;
+  std::string buf =
+      "POST /v1/chat/completions?stream=1 HTTP/1.1\r\n"
+      "Host: localhost\r\n"
+      "Content-Length: 2\r\n"
+      "Authorization:   Bearer k  \r\n"
+      "\r\n"
+      "hi";
+  check(parse_request(buf, r), "a POST parses");
+  check(r.method == "POST" && r.target == "/v1/chat/completions" && r.query == "stream=1",
+        "request line and query string");
+  check(r.body == "hi" && buf.empty(), "the body is read to Content-Length, and consumed");
+  check(r.header("AUTHORIZATION") == "Bearer k", "header names are case-insensitive, values trimmed");
+  check(r.header("host") == "localhost" && r.header("absent").empty(), "header lookup");
+
+  buf = "GET /a HTTP/1.1\r\n\r\nGET /b HTTP/1.1\r\n\r\n";
+  HttpRequest a, b;
+  check(parse_request(buf, a) && parse_request(buf, b) && a.target == "/a" && b.target == "/b" &&
+            buf.empty(),
+        "two requests back to back on a keep-alive connection");
+
+  buf = "GET /lf HTTP/1.0\nHost: x\n\n";
+  check(parse_request(buf, r) && r.target == "/lf" && r.version == "HTTP/1.0",
+        "LF-only line endings");
+
+  buf = "GET /half HTTP/1.1\r\nHost: x\r\n";
+  const std::string before = buf;
+  check(!parse_request(buf, r) && buf == before, "a half-arrived request is left alone");
+
+  buf = "POST /x HTTP/1.1\r\nContent-Length: 10\r\n\r\nshort";
+  check(!parse_request(buf, r), "so is a half-arrived body");
+
+  buf = "POST /x HTTP/1.1\r\nContent-Length: nosense\r\n\r\n";
+  check(throws([&] { parse_request(buf, r); }), "a bad Content-Length throws");
+  buf = "GARBAGE\r\n\r\n";
+  check(throws([&] { parse_request(buf, r); }), "a malformed request line throws");
+  buf = "POST /x HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n";
+  check(throws([&] { parse_request(buf, r); }), "chunked bodies are refused by name");
+}
+
+// Runs pieces through a filter the way a reply arrives, one token at a time.
+std::string through_stops(const std::vector<std::string>& stops,
+                          const std::vector<std::string>& pieces) {
+  StopFilter f(stops);
+  std::string out;
+  for (const std::string& p : pieces) out += f.feed(p);
+  out += f.finish();
+  return out;
+}
+
+void test_stop_filter() {
+  printf("\nstop sequences\n");
+  check(through_stops({"STOP"}, {"hello ", "world"}) == "hello world",
+        "with no stop in sight, everything comes out");
+  check(through_stops({"STOP"}, {"hello ST", "OP and more"}) == "hello ",
+        "a stop split across two pieces still stops");
+  check(through_stops({"STOP", "###"}, {"a", "###", "b"}) == "a", "the earliest stop wins");
+  check(through_stops({"STOP"}, {"S", "x", "y"}) == "Sxy", "a near miss is let through");
+  check(through_stops({"ab"}, {"a"}) == "a", "a stop that never arrives comes out at the end");
+  check(through_stops({"STOP"}, {"STOP"}) == "", "a stop at the very start leaves nothing");
+
+  // The reply is bytes, and a piece can end in the middle of a character.
+  check(utf8_complete("abc", 3) == 3, "ascii is complete");
+  check(utf8_complete("caf\xC3\xA9", 5) == 5, "a whole 2-byte character is complete");
+  check(utf8_complete("caf\xC3", 4) == 3, "a lead byte with no continuation is not");
+  check(utf8_complete("\xE4\xB8", 2) == 0, "nor a 3-byte character cut short twice over");
+  check(utf8_complete("\xF0\x9F\x98\x80", 4) == 4, "a whole 4-byte character is complete");
+  check(utf8_complete("\xF0\x9F\x98", 3) == 0, "nor a 4-byte one cut short");
+}
+
+void test_tools() {
+  printf("\ntool calls\n");
+
+  // ---- the template ----
+  const std::vector<ToolSpec> tools{
+      ToolSpec{R"({"type": "function", "function": {"name": "bash"}})"}};
+  const std::vector<Message> one{{"user", "list the files"}};
+  const std::string p = render_chat(one, "", false, tools);
+  const std::string head =
+      "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n"
+      "<tools>\n" + tools[0].json + "\n</tools>";
+  check(p.rfind(head, 0) == 0, "the schemas open the prompt, in the template's own words");
+  check(p.find("<function=example_function_name>") != std::string::npos,
+        "...followed by the format the model was taught");
+  check(p.find("\n\n<IMPORTANT>\nReminder:\n") != std::string::npos,
+        "...and the rules that go with it");
+  check(p.find("<|im_end|>\n<|im_start|>user\nlist the files<|im_end|>\n"
+               "<|im_start|>assistant\n<think>\n\n</think>\n\n") != std::string::npos,
+        "...then the messages, then the opener");
+  check(render_chat(one, "Be terse.", false, tools)
+            .find("</IMPORTANT>\n\nBe terse.<|im_end|>\n") != std::string::npos,
+        "the system prompt shares that block, after the tools");
+  check(render_chat(one, "", false).find("# Tools") == std::string::npos,
+        "and with no tools there is no preamble at all");
+
+  // ---- a conversation with a call in it ----
+  std::vector<Message> chat{{"user", "list the files"}, {"assistant", ""},
+                            {"tool", "a.txt\nb.txt"}, {"user", "thanks"}};
+  chat[1].tool_calls.push_back(ToolCall{"", "bash", R"({"command": "ls"})"});
+  const std::string r = render_chat(chat, "", false);
+  check(r.find("<|im_start|>assistant\n<tool_call>\n<function=bash>\n<parameter=command>\n"
+               "ls\n</parameter>\n</function>\n</tool_call><|im_end|>\n") !=
+            std::string::npos,
+        "an echoed call goes back in the model's own format");
+  check(r.find("<|im_start|>user\n<tool_response>\na.txt\nb.txt\n</tool_response>"
+               "<|im_end|>\n") != std::string::npos,
+        "a tool result is a user block");
+  check(render_chat({{"assistant", "done"}, {"tool", "1"}, {"tool", "2"}}, "", false)
+            .find("<|im_start|>user\n<tool_response>\n1\n</tool_response>\n"
+                  "<tool_response>\n2\n</tool_response><|im_end|>\n") != std::string::npos,
+        "consecutive results share one user block");
+
+  // In an agent loop the call is the last assistant turn, so it carries the
+  // reasoning block the template opens for the turn being continued.
+  std::vector<Message> loop{{"user", "list the files"}, {"assistant", ""}, {"tool", "a.txt"}};
+  loop[1].tool_calls.push_back(ToolCall{"", "bash", R"({"command": "ls"})"});
+  check(render_chat(loop, "", false)
+            .find("<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n") !=
+            std::string::npos,
+        "the turn after the last question keeps its reasoning block");
+
+  // ---- reading the model's calls back ----
+  ToolCallParser::Types types{{"bash", {{"command", "string"}, {"timeout", "number"}}}};
+  ToolCallParser parse(types);
+  ToolCallParser::Piece piece = parse.feed(
+      "Sure.\n<tool_call>\n<function=bash>\n<parameter=command>\nls -la\n</parameter>\n"
+      "<parameter=timeout>\n30\n</parameter>\n</function>\n</tool_call>");
+  check(piece.text == "Sure.\n" && piece.calls.size() == 1, "a call comes out of the content");
+  check(piece.calls.size() == 1 && piece.calls[0].name == "bash", "...with its name");
+  check(piece.calls.size() == 1 &&
+            piece.calls[0].arguments == R"({"command":"ls -la","timeout":30})",
+        "...and arguments typed as the schema declares them");
+  check(piece.calls.size() == 1 && piece.calls[0].id.rfind("call-", 0) == 0,
+        "...and an id for the client to answer with");
+
+  ToolCallParser split({});
+  std::string text;
+  size_t calls = 0;
+  for (const char* part : {"before <tool", "_call>\n<function=f>\n<parameter=a>\n1\n</pa",
+                           "rameter>\n</function>\n</tool_call> after"}) {
+    ToolCallParser::Piece out = split.feed(part);
+    text += out.text;
+    calls += out.calls.size();
+  }
+  check(text == "before  after" && calls == 1,
+        "a call split across pieces is still one call, and the prose survives");
+
+  ToolCallParser::Piece json_form = ToolCallParser({}).feed(
+      R"(<tool_call>{"name": "bash", "arguments": {"command": "ls"}}</tool_call>)");
+  check(json_form.calls.size() == 1 &&
+            json_form.calls[0].arguments == R"({"command":"ls"})",
+        "the JSON spelling of a call works too");
+
+  ToolCallParser open_tag({});
+  ToolCallParser::Piece held = open_tag.feed("use <tool_call> to call a function");
+  check(held.calls.empty() && held.text == "use ", "an unclosed tag is held back");
+  check(open_tag.finish().text == "<tool_call> to call a function",
+        "...and comes back out as text at the end");
+
+  ToolCallParser::Piece not_call =
+      ToolCallParser({}).feed("<tool_call>just words</tool_call>");
+  check(not_call.calls.empty() && not_call.text == "<tool_call>just words</tool_call>",
+        "a block that is not a call stays text");
+
+  check(json::dump(json::parse(R"({"a": 1, "b": [true, null, "x"], "c": 1.5, "d": "q\"t"})")) ==
+            R"({"a":1,"b":[true,null,"x"],"c":1.5,"d":"q\"t"})",
+        "json::dump writes back what it read");
+
+  // ---- the checkpoint's own template, held against the renderer ----
+  const std::string qwen =
+      "<|im_start|>system\n# Tools\n\n<tools>{}\n</tools>\n<tool_call><function=<parameter="
+      "<tool_response><|im_end|>";
+  check(template_mismatch(qwen).empty(), "this family's template passes");
+  check(template_mismatch("<|start_header_id|>user<|end_header_id|>").find("no <|im_start|>") !=
+            std::string::npos,
+        "another family's template is refused");
+  const std::string no_tools = template_mismatch("<|im_start|>user\nhi<|im_end|>\n");
+  check(no_tools.find("tool_call tags") != std::string::npos &&
+            no_tools.find("tool_response") != std::string::npos,
+        "a template with no tool format says what is missing");
+  check(!template_mismatch("").empty(), "so does a checkpoint with no template at all");
+}
+
 double mono() {
   return std::chrono::duration<double>(
              std::chrono::steady_clock::now().time_since_epoch())
@@ -533,6 +776,10 @@ int main(int argc, char** argv) {
   }
   test_sampler();
   test_delta();
+  test_template();
+  test_tools();
+  test_http();
+  test_stop_filter();
   test_lineread(argv[0]);
   if (want_model) {
     try {
