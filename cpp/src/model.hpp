@@ -129,6 +129,13 @@ struct GatedRMSNorm {
 // offset), `bias` is the layer's additive bias. The text model has none; the
 // vision tower has one on every linear.
 struct Linear {
+  // At this many rows (a prefill window) a quantized weight is dequantized to
+  // bf16 for the call and multiplied densely: MLX's dense GEMM runs at 12.9
+  // TFLOP/s on an M3 Max against 11.3 for its quantized one, and from ~512 rows
+  // that outruns the cost of dequantizing. Below it, and for decode, the
+  // quantized kernels win.
+  static constexpr int kDequantRows = 512;
+
   mx::array w;
   std::optional<mx::array> scales;
   std::optional<mx::array> biases;
@@ -252,6 +259,9 @@ struct Rope {
 std::vector<int> mrope_axes(int rotary_dim, const std::vector<int>& section);
 
 struct Attention {
+  // Ceiling on one attention call's score matrix; see operator().
+  static constexpr size_t kScoreBudget = size_t{512} << 20;
+
   int n_heads, n_kv, hd, rotary_dim;
   float scale, rope_theta;
   bool output_gate;

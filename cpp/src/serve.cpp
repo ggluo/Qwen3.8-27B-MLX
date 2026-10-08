@@ -126,10 +126,17 @@ std::string new_id(const char* prefix) {
   return buf;
 }
 
-std::string usage_json(int prompt_n, int completion_n) {
-  return "{\"prompt_tokens\":" + std::to_string(prompt_n) +
+// `prompt_tokens` is the whole prompt the request stands for, as the API defines
+// it -- what was already in the context plus what this request fed -- with the
+// reused part reported as `cached_tokens`. Clients size their context window
+// from this number; reporting only the fed tail made a long agent session look
+// like a few hundred tokens, so the client never compacted it.
+std::string usage_json(int prompt_n, int completion_n, size_t cached) {
+  const long long prompt = static_cast<long long>(cached) + prompt_n;
+  return "{\"prompt_tokens\":" + std::to_string(prompt) +
          ",\"completion_tokens\":" + std::to_string(completion_n) +
-         ",\"total_tokens\":" + std::to_string(prompt_n + completion_n) + "}";
+         ",\"total_tokens\":" + std::to_string(prompt + completion_n) +
+         ",\"prompt_tokens_details\":{\"cached_tokens\":" + std::to_string(cached) + "}}";
 }
 
 // ---------------------------------------------------------------------------
@@ -298,9 +305,10 @@ bool send_finish(int fd, const std::string& id, long long created,
 }
 
 bool send_usage_chunk(int fd, const std::string& id, long long created,
-                      const std::string& model, int prompt_n, int completion_n) {
+                      const std::string& model, int prompt_n, int completion_n,
+                      size_t cached) {
   return send_event(fd, chunk_open(id, created, model) +
-                           "],\"usage\":" + usage_json(prompt_n, completion_n) + "}");
+                           "],\"usage\":" + usage_json(prompt_n, completion_n, cached) + "}");
 }
 
 // ---------------------------------------------------------------------------
@@ -1274,7 +1282,7 @@ bool Server::handle(const ChatRequest& cr, int fd) {
   if (cr.stream) {
     ok = send_finish(fd, id, created, opt.model_name, finish);
     if (ok && cr.include_usage) {
-      ok = send_usage_chunk(fd, id, created, opt.model_name, st.prompt_n, st.n);
+      ok = send_usage_chunk(fd, id, created, opt.model_name, st.prompt_n, st.n, reused);
     }
     if (ok) ok = send_sse_end(fd);
   } else {
@@ -1300,7 +1308,7 @@ bool Server::handle(const ChatRequest& cr, int fd) {
       body += "]";
     }
     body += "},\"finish_reason\":\"" + std::string(finish) + "\"}],\"usage\":" +
-            usage_json(st.prompt_n, st.n) + "}";
+            usage_json(st.prompt_n, st.n, reused) + "}";
     ok = send_response(fd, 200, "application/json", body);
   }
 
@@ -1314,9 +1322,9 @@ bool Server::handle(const ChatRequest& cr, int fd) {
     snprintf(pics, sizeof(pics), " [%d picture%s, %.1fs vision]", st.images,
              st.images == 1 ? "" : "s", st.vision_t);
   }
-  fprintf(stderr, "  %s %d in + %d out in %.1fs (prefill %.1fs %.0f tok/s,"
+  fprintf(stderr, "  %s %d in (%zu cached) + %d out in %.1fs (prefill %.1fs %.0f tok/s,"
                   " decode %.1fs %.1f tok/s)%s%s%s\n",
-          append ? "continued" : "prefilled", st.prompt_n, st.n, dt, st.prefill_t,
+          append ? "continued" : "prefilled", st.prompt_n, reused, st.n, dt, st.prefill_t,
           st.prompt_n / (st.prefill_t > 0 ? st.prefill_t : 1e-9), decode_t,
           st.n / decode_t, pics, cr.think ? " [think]" : "",
           stops.hit() ? " [stop sequence]"
@@ -1325,7 +1333,7 @@ bool Server::handle(const ChatRequest& cr, int fd) {
   if (cr.dump_no) {
     std::string out = "{\"continued\":" + std::string(append ? "true" : "false") +
                       ",\"prompt\":" + dump_breakdown(cr, from, reused) +
-                      ",\"usage\":" + usage_json(st.prompt_n, st.n) +
+                      ",\"usage\":" + usage_json(st.prompt_n, st.n, reused) +
                       ",\"finish_reason\":" + quoted(finish) + ",\"timings\":{\"prefill_s\":" +
                       std::to_string(st.prefill_t) + ",\"decode_s\":" + std::to_string(st.dt) +
                       ",\"total_s\":" + std::to_string(dt) + "},\"message\":{\"role\":\"assistant\"";

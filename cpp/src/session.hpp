@@ -133,7 +133,7 @@ std::string template_mismatch(const std::string& chat_template);
 class Session {
  public:
   Session(const Model& model, const Tokenizer& tk, std::string system, bool spec,
-          int draft_k, int prefill_step = 384);
+          int draft_k, int prefill_step = 1024);
 
   // Drops the conversation and starts over.
   void reset();

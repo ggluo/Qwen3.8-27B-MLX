@@ -17,18 +17,23 @@
 //
 // THE MAPPING
 // -----------
-// One thread per (batch, head, dv). Each thread owns state row S[b,h,v,:] -- 128
-// contiguous floats -- and computes
+// One simdgroup (32 lanes) per R=4 state rows S[b,h,v0..v0+4,:]. Each row is 128
+// contiguous floats, split so lane j holds elements j, j+32, j+64, j+96, and
+// per row the simdgroup computes
 //
-//     kS[v]    = sum_dk k[dk] * S[v,dk]        (reduction, in-thread)
+//     kS[v]    = sum_dk k[dk] * S[v,dk]        (simd_sum across the 32 lanes)
 //     S[v,dk] <- a*(S[v,dk] - b*kS[v]*k[dk]) + b*v[v]*k[dk]
-//     o[v]     = sum_dk q[dk] * S[v,dk]        (reduction, in-thread)
+//     o[v]     = sum_dk q[dk] * S[v,dk]        (simd_sum across the 32 lanes)
 //
-// Both reductions run over the thread's own row, so there is no cross-thread
-// communication and no threadgroup memory. That only works because the state is
-// laid out (Dv, Dk) rather than (Dk, Dv): the thread's row must be contiguous.
-// Choosing (Dk, Dv) would make kS a 128-way reduction ACROSS threads. This is
-// why both reference implementations store the state as (Dv, Dk).
+// The rows must be contiguous, which is why the state is laid out (Dv, Dk)
+// rather than (Dk, Dv) -- as both reference implementations store it.
+//
+// The first version gave each thread a whole row: no cross-lane traffic at all,
+// but only 6144 threads for the GPU, each holding 128 floats, and every one of
+// them loading all of k and q on every step. Splitting rows across lanes gives
+// the GPU 32x the threads, and sharing a step's k/q loads among four rows cuts
+// that traffic 4x: 153 ms -> 42 ms for 48 layers at L=384, which took prefill
+// from 175 to 203 tok/s on its own. Decode (L=1) is unchanged, at ~9.5 ms.
 //
 // For L > 1 the loop over time lives inside the kernel, so the state is read and
 // written once for the whole block rather than once per step.

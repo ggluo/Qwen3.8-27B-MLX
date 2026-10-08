@@ -11,64 +11,85 @@ namespace delta {
 namespace {
 
 // The kernel body. MLX exposes the declared inputs/outputs as device pointers
-// with these names; DK/DV/H/L are baked in so `float s[DK]` is a fixed-size
-// register array rather than a dynamic allocation.
+// with these names; DK/DV/H/L/R are baked in so `float s[R][NP]` is a
+// fixed-size register array rather than a dynamic allocation.
 const char* kBody = R"METAL(
-    uint gid = thread_position_in_grid.x;
-
     const uint DK = @DK@;
     const uint DV = @DV@;
     const uint H  = @H@;
     const uint L  = @L@;
+    const uint R  = @R@;
+    const uint NP = DK / 32;
 
-    uint vv = gid % DV;
-    uint h  = (gid / DV) % H;
-    uint b  =  gid / (DV * H);
+    uint lane = thread_position_in_grid.x;
+    uint v0   = thread_position_in_grid.y * R;
+    uint bh   = thread_position_in_grid.z;
+    uint h = bh % H;
+    uint b = bh / H;
 
-    // this thread's state row: (b, h, vv, :) over DK, contiguous
-    uint sbase = ((b * H + h) * DV + vv) * DK;
+    // this simdgroup's R state rows (b, h, v0..v0+R, :), each contiguous over
+    // DK; lane owns elements lane, lane+32, lane+64, ... of every row
+    uint sbase = (bh * DV + v0) * DK + lane;
 
-    float s[@DK@];
-    for (uint d = 0; d < DK; ++d) {
-        s[d] = S_in[sbase + d];
+    float s[R][NP];
+    for (uint r = 0; r < R; ++r) {
+        for (uint i = 0; i < NP; ++i) {
+            s[r][i] = S_in[sbase + r * DK + i * 32];
+        }
     }
 
     for (uint t = 0; t < L; ++t) {
         uint hb = (b * L + t) * H + h;      // index into (B,L,H)
-        uint kb = hb * DK;                  // index into (B,L,H,DK)
+        uint kb = hb * DK + lane;           // this lane's first element of (B,L,H,DK)
         float a  = alpha[hb];
         float bb = beta[hb];
-        float vt = v[hb * DV + vv];
 
-        // kS = k . s   (over this thread's own row)
-        float kS = 0.0f;
-        for (uint d = 0; d < DK; ++d) {
-            kS += k[kb + d] * s[d];
+        float kk[NP], qq[NP];
+        for (uint i = 0; i < NP; ++i) {
+            kk[i] = k[kb + i * 32];
+            qq[i] = q[kb + i * 32];
         }
 
-        // fused state update + output reduction in one pass over the row
-        float ov = 0.0f;
-        for (uint d = 0; d < DK; ++d) {
-            float kd = k[kb + d];
-            float sn = a * (s[d] - bb * kS * kd) + bb * vt * kd;
-            s[d] = sn;
-            ov += q[kb + d] * sn;
+        for (uint r = 0; r < R; ++r) {
+            float vt = v[hb * DV + v0 + r];
+
+            // kS = k . s   (over the row, reduced across the simdgroup)
+            float kS = 0.0f;
+            for (uint i = 0; i < NP; ++i) {
+                kS += kk[i] * s[r][i];
+            }
+            kS = simd_sum(kS);
+
+            // fused state update + output reduction in one pass over the row
+            float ov = 0.0f;
+            for (uint i = 0; i < NP; ++i) {
+                float sn = a * (s[r][i] - bb * kS * kk[i]) + bb * vt * kk[i];
+                s[r][i] = sn;
+                ov += qq[i] * sn;
+            }
+            ov = simd_sum(ov);
+            if (lane == 0) {
+                o[hb * DV + v0 + r] = ov;
+            }
         }
-        o[hb * DV + vv] = ov;
 @COLLECT@
     }
 
-    for (uint d = 0; d < DK; ++d) {
-        S_out[sbase + d] = s[d];
+    for (uint r = 0; r < R; ++r) {
+        for (uint i = 0; i < NP; ++i) {
+            S_out[sbase + r * DK + i * 32] = s[r][i];
+        }
     }
 )METAL";
 
-// When collecting per-step states (for speculative rollback), also dump the row
+// When collecting per-step states (for speculative rollback), also dump the rows
 // after every step into (B, H, L, DV, DK).
 const char* kCollectBody = R"METAL(
-        uint cb = (((b * H + h) * L + t) * DV + vv) * DK;
-        for (uint d = 0; d < DK; ++d) {
-            S_all[cb + d] = s[d];
+        uint cb = (((b * H + h) * L + t) * DV + v0) * DK + lane;
+        for (uint r = 0; r < R; ++r) {
+            for (uint i = 0; i < NP; ++i) {
+                S_all[cb + r * DK + i * 32] = s[r][i];
+            }
         }
 )METAL";
 
@@ -78,11 +99,11 @@ void replace_all(std::string& s, const std::string& from, const std::string& to)
   }
 }
 
-using Key = std::tuple<int, int, int, int, bool>;
+using Key = std::tuple<int, int, int, int, int, bool>;
 
-mx::fast::CustomKernelFunction& kernel(int DK, int DV, int H, int L, bool collect) {
+mx::fast::CustomKernelFunction& kernel(int DK, int DV, int H, int L, int R, bool collect) {
   static std::map<Key, mx::fast::CustomKernelFunction> cache;
-  Key key{DK, DV, H, L, collect};
+  Key key{DK, DV, H, L, R, collect};
   auto it = cache.find(key);
   if (it != cache.end()) return it->second;
 
@@ -92,9 +113,10 @@ mx::fast::CustomKernelFunction& kernel(int DK, int DV, int H, int L, bool collec
   replace_all(src, "@DV@", std::to_string(DV));
   replace_all(src, "@H@", std::to_string(H));
   replace_all(src, "@L@", std::to_string(L));
+  replace_all(src, "@R@", std::to_string(R));
 
   std::ostringstream name;
-  name << "gated_delta_" << DK << "_" << DV << "_" << H << "_" << L << "_"
+  name << "gated_delta_" << DK << "_" << DV << "_" << H << "_" << L << "_" << R << "_"
        << (collect ? 1 : 0);
   std::vector<std::string> outputs{"o", "S_out"};
   if (collect) outputs.push_back("S_all");
@@ -123,15 +145,19 @@ Result run(const mx::array& q_in, const mx::array& k_in, const mx::array& v_in,
   mx::array alpha = f32(alpha_in), beta = f32(beta_in);
   mx::array S = S_in ? f32(*S_in) : mx::zeros({B, H, Dv, Dk}, mx::float32);
 
-  const int nthreads = B * H * Dv;
-  const int tg = (nthreads % 128 == 0) ? 128 : 32;
+  if (Dk % 32 != 0) return run_reference(q, k, v, alpha, beta, S, collect);
+  // R rows per simdgroup share each step's k and q loads; four simdgroups per
+  // threadgroup. Both measured: R=4 beat 1, 2 and 8 at L=384.
+  const int R = (Dv % 4 == 0) ? 4 : 1;
+  const int groups = Dv / R;
+  const int tgy = (groups % 4 == 0) ? 4 : 1;
 
   std::vector<mx::Shape> shapes{{B, L, H, Dv}, {B, H, Dv, Dk}};
   if (collect) shapes.push_back({B, H, L, Dv, Dk});
   std::vector<mx::Dtype> dtypes(shapes.size(), mx::float32);
 
-  std::vector<mx::array> outs = kernel(Dk, Dv, H, L, collect)(
-      {q, k, v, alpha, beta, S}, shapes, dtypes, {nthreads, 1, 1}, {tg, 1, 1}, {},
+  std::vector<mx::array> outs = kernel(Dk, Dv, H, L, R, collect)(
+      {q, k, v, alpha, beta, S}, shapes, dtypes, {32, groups, B * H}, {32, tgy, 1}, {},
       std::nullopt, false, {});
 
   Result r{outs[0], outs[1], {}};

@@ -262,8 +262,12 @@ arrival order — the same order as the log lines:
 }
 ```
 
-`reused_tokens` plus `usage.prompt_tokens` is the context the next turn starts
-from, which is how you check the cache is doing what it claims.
+`usage` itself follows the API: `prompt_tokens` is the whole prompt the request
+stands for, and `prompt_tokens_details.cached_tokens` is the part the session
+already held (`reused_tokens` here). So `prompt_tokens + completion_tokens` is the
+context the next turn starts from, which is what an agent client measures its
+context window by, and `prompt_tokens - cached_tokens` is what this request
+actually prefilled.
 
 That breakdown is how you answer "why is this prompt 17k tokens long": a prompt
 that size is almost always the client's own doing — an agent's instructions, the

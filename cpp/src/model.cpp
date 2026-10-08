@@ -357,6 +357,11 @@ mx::array Linear::operator()(const mx::array& x) const {
   // The bias goes in exactly as MLX's own layers put it: fused into the matmul
   // for a plain Linear (addmm, one rounding), added afterwards for a quantized one.
   // Anything else would round differently from the Python port.
+  if (quantized() && x.ndim() == 3 && x.shape(1) >= kDequantRows) {
+    mx::array y = mx::matmul(
+        x, mx::transpose(mx::dequantize(w, *scales, biases, group_size, bits)));
+    return bias ? mx::add(y, *bias) : y;
+  }
   if (quantized()) {
     mx::array y = mx::quantized_matmul(x, w, *scales, biases, /*transpose=*/true,
                                        group_size, bits);
@@ -544,9 +549,31 @@ mx::array Attention::operator()(const mx::array& x,
     v = kv.second;
   }
 
-  mx::array o = mask ? mx::fast::scaled_dot_product_attention(q, k, v, scale,
-                                                              "array", {*mask})
-                     : mx::fast::scaled_dot_product_attention(q, k, v, scale);
+  // MLX has no fused prefill kernel for head_dim 256, so its fallback
+  // materializes the (n_heads, L, context) scores: 0.8 GB for a 1024-token window
+  // at 16K context, 10 GB at 200K. Past the budget, feed the window's queries in
+  // slices, each against only the keys it can see -- every query's softmax is
+  // its own row, so this changes the memory and nothing else.
+  const int S = k.shape(2);
+  const int rows = mask ? static_cast<int>(std::max<size_t>(
+                              1, kScoreBudget / (sizeof(uint16_t) * n_heads * S)))
+                        : L;
+  mx::array o = mx::zeros({1});  // replaced immediately
+  if (!mask) {
+    o = mx::fast::scaled_dot_product_attention(q, k, v, scale);
+  } else if (rows >= L) {
+    o = mx::fast::scaled_dot_product_attention(q, k, v, scale, "array", {*mask});
+  } else {
+    std::vector<mx::array> parts;
+    for (int s = 0; s < L; s += rows) {
+      const int e = std::min(L, s + rows), seen = S - L + e;
+      mx::array m = slice_axis(slice_axis(*mask, 0, s, e), 1, 0, seen);
+      parts.push_back(mx::fast::scaled_dot_product_attention(
+          slice_axis(q, 2, s, e), slice_axis(k, 2, 0, seen), slice_axis(v, 2, 0, seen),
+          scale, "array", {m}));
+    }
+    o = mx::concatenate(parts, 2);
+  }
   o = mx::reshape(mx::transpose(o, {0, 2, 1, 3}), {B, L, n_heads * hd});
   if (gate) o = mx::multiply(o, mx::sigmoid(*gate));
   return o_proj(o);
@@ -589,10 +616,9 @@ mx::array GatedDeltaNet::operator()(const mx::array& x, DeltaCache* cache) const
 
   // Speculative blocks need every per-step state kept, for rollback.
   const bool recording = cache && cache->record;
-  // The fused kernel is correct at any L. Above L ~= 384 a chunked parallel scan
-  // would be faster (it turns time into matmuls, while this kernel is serial in
-  // t); that path is not ported, and prefill is windowed to 384 so it never runs
-  // past the crossover anyway.
+  // The fused kernel is correct at any L, and serial in t. A chunked parallel
+  // scan turns time into matmuls instead; it is not ported, because at the
+  // 1024-token prefill window the kernel is ~2% of the pass.
   delta::Result r = delta::available()
                         ? delta::run(q, k, v, alpha, beta, S, recording)
                         : delta::run_reference(q, k, v, alpha, beta, S, recording);

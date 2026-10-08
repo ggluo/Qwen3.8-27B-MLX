@@ -1181,12 +1181,21 @@ void test_serve_vision(const std::string& path, const std::string& data) {
       return std::string();
     }
   };
-  auto prompt_tokens = [](const Reply& r) {
+  // usage.prompt_tokens is the whole prompt; what this request actually fed is
+  // that minus the part the context already held.
+  auto usage_of = [](const Reply& r, const char* field) {
     try {
-      return static_cast<int>(json::parse(r.body)["usage"]["prompt_tokens"].as_int(-1));
+      const json::Value u = json::parse(r.body)["usage"];
+      if (std::string(field) == "cached_tokens") {
+        return static_cast<int>(u["prompt_tokens_details"]["cached_tokens"].as_int(-1));
+      }
+      return static_cast<int>(u[field].as_int(-1));
     } catch (const std::exception&) {
       return -1;
     }
+  };
+  auto prompt_tokens = [&](const Reply& r) {
+    return usage_of(r, "prompt_tokens") - usage_of(r, "cached_tokens");
   };
   auto error_of = [](const Reply& r) {
     try {
@@ -1229,6 +1238,14 @@ void test_serve_vision(const std::string& path, const std::string& data) {
         "echoed history continues: \"" + brief(c2) + "\", " + std::to_string(p2) +
             " new prompt tokens -- exactly the new turn (" + std::to_string(tail_tokens(t2)) +
             "), the echoed reply not fed again");
+
+  // ... while usage reports the whole context, so a client can size its window:
+  //    everything the first turn left behind is counted as cached
+  const int whole1 = usage_of(r1, "prompt_tokens") + usage_of(r1, "completion_tokens");
+  check(usage_of(r1, "cached_tokens") == 0 && usage_of(r2, "cached_tokens") > whole1 &&
+            usage_of(r2, "prompt_tokens") == usage_of(r2, "cached_tokens") + p2,
+        "usage counts the whole context: " + std::to_string(usage_of(r2, "prompt_tokens")) +
+            " prompt tokens, " + std::to_string(usage_of(r2, "cached_tokens")) + " of them cached");
 
   // ... and again: a third turn in a row feeds only its own turn too
   const std::string a2 = msg("assistant", jtext(c2));
