@@ -29,6 +29,7 @@ Checkpoint directories live here at the root, so both implementations share them
 
 | Also here | |
 |---|---|
+| [`MODEL_WALKTHROUGH.md`](MODEL_WALKTHROUGH.md) | One forward pass, module by module: tensor shapes, the cost of each module, the KV cache, and prefill vs decode |
 | [`PERFORMANCE_MODEL.md`](PERFORMANCE_MODEL.md) | Measured FLOPs/token, the roofline, and the memory wall |
 | [`BUILD_LOG.md`](BUILD_LOG.md) | How this was built, wrong turns included |
 

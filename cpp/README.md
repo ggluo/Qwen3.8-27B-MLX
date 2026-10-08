@@ -430,7 +430,19 @@ settings, separate processes, repeated.
 | model load | 0.7 s | 0.5 s | |
 | wall clock, trivial prompt | 1.37 s | 0.98 s | −0.4 s |
 
-Prefill ~176 tok/s (1634 tokens in 9.3 s); peak 17.5 GB on a 1.6K-token prompt.
+Prefill ~228 tok/s (2048 tokens in 9.0 s; it was 176 tok/s); peak 18.7 GB on a
+2K-token prompt. Prefill runs in 1024-token windows, and three things set its pace:
+
+| | 2048-token prefill |
+| --- | --- |
+| before | 11.7 s, 175 tok/s |
+| delta kernel: one simdgroup per four state rows, not one thread per row | 10.1 s, 203 tok/s |
+| windows of 1024, and quantized weights dequantized for dense matmul at >= 512 rows | 9.0 s, 228 tok/s |
+
+At that point the matmuls are ~93% of the pass, so what is left is MLX's GEMM.
+On a 16K-token prompt the window matters more: 78 s against 96 s at the old
+384, because each window re-reads every weight. Attention past ~10K context feeds
+a window's queries in slices, so the larger window does not raise the peak there.
 
 **The throughput is a wash, and that is the expected result.** Identical accept
 rate, tok/pass and pass count mean both implementations do precisely the same
@@ -493,10 +505,10 @@ same kernel for text positions, and write out the same explicit rotation for the
 ## Not ported
 
 * **The chunked parallel delta scan.** The fused Metal kernel is correct at any
-  `L`; above `L ≈ 384` a chunked scan is *faster*, because it turns time into
-  matmuls while the kernel is serial in `t`. Prefill is windowed to 384, so that
-  crossover is never reached, and the ~200 lines of triangular-inverse code would
-  be dead. `delta::run_reference` is kept as the oracle and the no-Metal fallback.
+  `L`, and serial in `t`; a chunked scan turns time into matmuls instead. With
+  the kernel spread across simdgroups it costs ~2% of a 1024-token prefill
+  window, which leaves the ~200 lines of triangular-inverse code nothing to win.
+  `delta::run_reference` is kept as the oracle and the no-Metal fallback.
 * **`../python/mlp_kernel.py`.** A documented negative result — three
   attempts at a fused quantized-SwiGLU kernel, all slower than stock MLX. It was
   never wired into the model, so there is nothing to port.
