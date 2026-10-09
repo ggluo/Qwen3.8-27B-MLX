@@ -36,6 +36,10 @@ struct ServeOptions {
   // Pictures above this many pixels are downscaled first; every 32x32 is one
   // token of prompt.
   long long max_pixels = image::kMaxPixels;
+  // How many conversations to hold at once, each with its own KV cache. A
+  // request that extends none of them takes a new slot, displacing the least
+  // recently used once all are taken.
+  int slots = 4;
 };
 
 // Binds, loads the model on the thread that will run it, then serves until

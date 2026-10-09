@@ -1258,6 +1258,20 @@ void test_serve_vision(const std::string& path, const std::string& data) {
         "a third turn continues the same way: \"" + brief(c2b) + "\", " +
             std::to_string(prompt_tokens(r2b)) + " new prompt tokens");
 
+  // An agent's side request between two turns -- a title, a recap, each with a
+  // system prompt of its own -- is a conversation of its own. It takes another
+  // slot, and the next turn of this one still feeds only its own tokens.
+  const Reply rs = http_post(sv[0], chat_body({msg("system", jtext("You are a title generator.")),
+                                               msg("user", jtext("hi"))},
+                                              4));
+  const std::string a3 = msg("assistant", jtext(c2b));
+  const std::string t4 = "And the background? One word.";
+  const Reply r4 = http_post(sv[0], chat_body({u1, a1, u2, a2, u3a, a3, msg("user", jtext(t4))}, 8));
+  check(rs.status == 200 && usage_of(rs, "cached_tokens") == 0 && r4.status == 200 &&
+            prompt_tokens(r4) == tail_tokens(t4),
+        "a side request between turns leaves the conversation cached: the next turn feeds " +
+            std::to_string(prompt_tokens(r4)) + " new prompt tokens, exactly its own");
+
   // A history that leaves out the reply is not the conversation the context
   // holds, so it has to start over rather than append after the reply.
   const Reply r2c = http_post(sv[0], chat_body({u1, u2}, 8));
@@ -1362,6 +1376,34 @@ void test_serve_vision(const std::string& path, const std::string& data) {
   check(r6.status == 200 && streamed.find("42") != std::string::npos &&
             r6.body.find("[DONE]") != std::string::npos,
         "a streamed reply about a picture: \"" + brief(streamed) + "\"");
+
+  // 8. The slots are bounded: a conversation survives slots-1 others started
+  //    after it, and is displaced by the slots-th.
+  auto side_requests = [&](int n, const std::string& tag) {
+    for (int i = 0; i < n; ++i) {
+      http_post(sv[0], chat_body({msg("system", jtext("Side request " + tag + std::to_string(i))),
+                                  msg("user", jtext("Say OK."))},
+                                 2));
+    }
+  };
+  const std::string y1 = msg("user", jtext("Say yes."));
+  const Reply ry1 = http_post(sv[0], chat_body({y1}, 4));
+  side_requests(opt.slots - 1, "a");
+  const std::string y2 = msg("user", jtext("Say no."));
+  const std::vector<std::string> y_hist{y1, msg("assistant", jtext(content_of(ry1))), y2};
+  const Reply ry2 = http_post(sv[0], chat_body(y_hist, 4));
+  check(ry2.status == 200 && prompt_tokens(ry2) == tail_tokens("Say no."),
+        "a conversation outlives " + std::to_string(opt.slots - 1) +
+            " others started after it: " + std::to_string(prompt_tokens(ry2)) +
+            " new prompt tokens");
+  side_requests(opt.slots, "b");
+  std::vector<std::string> y_more = y_hist;
+  y_more.push_back(msg("assistant", jtext(content_of(ry2))));
+  y_more.push_back(msg("user", jtext("Say maybe.")));
+  const Reply ry3 = http_post(sv[0], chat_body(y_more, 4));
+  check(ry3.status == 200 && usage_of(ry3, "cached_tokens") == 0,
+        "... and the " + std::to_string(opt.slots) + "th displaces it: " +
+            std::to_string(prompt_tokens(ry3)) + " prompt tokens from scratch");
 
   close(sv[0]);  // the server sees EOF, closes its end and returns
   server.join();

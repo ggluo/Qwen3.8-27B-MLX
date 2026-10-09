@@ -8,11 +8,14 @@
 //     reply is framed as chunked transfer-encoding, which is what gives it an
 //     end marker; without that, the only way to say "done" would be to close the
 //     connection.
-//   * The session's KV cache is reused across requests. A request whose messages
-//     extend the conversation the session is already holding appends only the
-//     new turns; anything else resets and re-prefills. That is the same bet the
-//     REPL makes, and it is why a chat client that echoes its history back does
-//     not pay for that history again on every turn.
+//   * KV caches are reused across requests. The server holds several
+//     conversations (--slots, default 4), each with its own caches; a request
+//     whose messages extend one of them appends only the new turns, and anything
+//     else starts a new one in a free slot, or in the least recently used. That is
+//     why a chat client that echoes its history back does not pay for that history
+//     again on every turn -- and why an agent's side requests, a title or a recap
+//     written with a system prompt of their own, do not cost its main
+//     conversation its cache.
 //
 // Threading is the other thing to know, and the reason for ModelThread below: a
 // connection thread never touches the model, it hands the request over.
@@ -39,6 +42,7 @@
 #include <functional>
 #include <future>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
@@ -934,15 +938,11 @@ ChatRequest parse_chat(const json::Value& body, const ServeOptions& opt) {
   return cr;
 }
 
-// The conversation. Everything here is touched only by the model thread.
-struct Server {
-  Server(const Model& m, const Tokenizer& tk, const ServeOptions& options)
-      : opt(options),
-        model(m),
-        session(m, tk, /*system=*/std::string(), opt.spec, opt.draft) {}
-
-  const ServeOptions& opt;
-  const Model& model;
+// One conversation the server is holding: a session with its own caches, and
+// what that session's context covers.
+struct Conversation {
+  Conversation(const Model& m, const Tokenizer& tk, const ServeOptions& opt)
+      : session(m, tk, /*system=*/std::string(), opt.spec, opt.draft) {}
 
   Session session;
   // the messages the session's context already covers -- INCLUDING the last
@@ -952,6 +952,34 @@ struct Server {
   std::string held_system;        // ... and the system prompt it covers them with
   std::vector<ToolSpec> held_tools;  // ... and the tools
   bool held_ok = false;           // ... and covers exactly, so a request can extend it
+  unsigned long long used = 0;    // when it last served a request, for eviction
+};
+
+// The conversations. Everything here is touched only by the model thread.
+//
+// Why more than one: an agent client does not only send its conversation. Between
+// turns it asks the same model for a title, or a recap of the turn, each with a
+// system prompt of its own. With one conversation held, each of those reset it,
+// and the next turn re-prefilled the whole history -- 20K tokens, two minutes on
+// the 27B -- for the sake of a 700-token side request. Each slot costs its
+// context's KV cache (64 KB a token on the 27B) plus the fixed DeltaNet state.
+struct Server {
+  Server(const Model& m, const Tokenizer& t, const ServeOptions& options)
+      : opt(options), model(m), tk(t) {}
+
+  const ServeOptions& opt;
+  const Model& model;
+  const Tokenizer& tk;
+
+  std::vector<std::unique_ptr<Conversation>> convs;
+  unsigned long long clock = 0;
+
+  // The conversation `cr` extends, if any: the one holding most of it.
+  Conversation* find(const ChatRequest& cr) const;
+  // A slot for a new conversation: an unused one, else one that can never be
+  // continued, else the least recently used. Not yet reset.
+  Conversation& claim();
+  size_t slot_of(const Conversation* c) const;
 
   bool handle(const ChatRequest& cr, int fd);
 };
@@ -1100,6 +1128,47 @@ bool same_message(const Message& a, const Message& b) {
   return true;
 }
 
+Conversation* Server::find(const ChatRequest& cr) const {
+  // A request that is a held conversation plus more -- which is what every turn
+  // of a chat looks like -- only appends. The system prompt and the tools are part
+  // of the head that conversation already holds, so a change to either does not
+  // extend it.
+  Conversation* best = nullptr;
+  for (const std::unique_ptr<Conversation>& c : convs) {
+    if (c->held_ok && c->held_system == cr.system && c->held_tools == cr.tools &&
+        cr.msgs.size() > c->held.size() &&
+        std::equal(c->held.begin(), c->held.end(), cr.msgs.begin(), same_message) &&
+        (!best || c->held.size() > best->held.size())) {
+      best = c.get();
+    }
+  }
+  return best;
+}
+
+Conversation& Server::claim() {
+  const size_t slots = static_cast<size_t>(std::max(1, opt.slots));
+  if (convs.size() < slots) {
+    convs.push_back(std::unique_ptr<Conversation>(new Conversation(model, tk, opt)));
+    return *convs.back();
+  }
+  // One that can never be continued (a reply cut short) is worth nothing to keep.
+  Conversation* victim = nullptr;
+  for (const std::unique_ptr<Conversation>& c : convs) {
+    if (!victim || (!c->held_ok && victim->held_ok) ||
+        (c->held_ok == victim->held_ok && c->used < victim->used)) {
+      victim = c.get();
+    }
+  }
+  return *victim;
+}
+
+size_t Server::slot_of(const Conversation* c) const {
+  for (size_t i = 0; i < convs.size(); ++i) {
+    if (convs[i].get() == c) return i;
+  }
+  return convs.size();
+}
+
 bool Server::handle(const ChatRequest& cr, int fd) {
   const std::string id = new_id("chatcmpl");
   const long long created = time(nullptr);
@@ -1109,18 +1178,13 @@ bool Server::handle(const ChatRequest& cr, int fd) {
   // loop would otherwise stop before its first token.
   take_interrupt();
 
-  // A request that is the conversation the session holds plus more -- which is
-  // what every turn of a chat looks like -- only appends. Anything else (a new
-  // conversation, another client, an edited history) starts over. The system
-  // prompt and the tools are part of the head the session already holds, so a
-  // change to either has to start over too.
-  const bool same_head = held_system == cr.system && held_tools == cr.tools;
-  const bool append =
-      held_ok && same_head && cr.msgs.size() > held.size() &&
-      std::equal(held.begin(), held.end(), cr.msgs.begin(), same_message);
-  const size_t from = append ? held.size() : 0;
+  // Extend a held conversation if this request is one plus more; anything else (a
+  // new conversation, a side request, an edited history) starts a new one.
+  Conversation* conv = find(cr);
+  const bool append = conv != nullptr;
+  const size_t from = append ? conv->held.size() : 0;
 
-  const std::string prompt = append ? render_tail(cr.msgs, held.size(), cr.think)
+  const std::string prompt = append ? render_tail(cr.msgs, from, cr.think)
                                     : render_chat(cr.msgs, cr.system, cr.think, cr.tools);
 
   // What actually went to the model. A cold render is the whole conversation,
@@ -1156,19 +1220,25 @@ bool Server::handle(const ChatRequest& cr, int fd) {
       }
     }
     if (!bad.empty()) {
-      // Refused before the session is touched -- including the reset below -- so
-      // it still holds exactly `held`, and the next good request continues it.
+      // Refused before any conversation is touched -- including the claim below --
+      // so each still holds exactly its `held`, and the next good request
+      // continues it.
       dump_text(opt.dump_dir, cr.dump_no, "response.json", "{\"error\":" + quoted(bad) + "}");
       fprintf(stderr, "  refused: %s\n", bad.c_str());
       return send_error(fd, 400, bad);
     }
   }
 
+  size_t evicted = 0;  // tokens of the conversation a new one displaced
   if (!append) {
-    session.reset();
-    held.clear();
-    held_ok = false;
+    conv = &claim();
+    evicted = conv->session.context_tokens();
+    conv->session.reset();
+    conv->held.clear();
+    conv->held_ok = false;
   }
+  conv->used = ++clock;
+  Session& session = conv->session;
   // What the session held before this turn: the difference between this and the
   // prompt is what the KV cache reuse bought.
   const size_t reused = session.context_tokens();
@@ -1245,7 +1315,7 @@ bool Server::handle(const ChatRequest& cr, int fd) {
   // early -- a client that hangs up, Ctrl-C, an exception out of generation --
   // leaves it untrusted, and the next request starts over rather than appending
   // to a context that is not what `held` says.
-  held_ok = false;
+  conv->held_ok = false;
 
   session.turn_prompt(prompt, cr.temp, cr.top_p, cr.top_k, cr.max_tokens,
                       [&](const std::string& piece) { splitter.feed(piece); }, pictures);
@@ -1266,18 +1336,18 @@ bool Server::handle(const ChatRequest& cr, int fd) {
   // wrote, closed with <|im_end|>. Record the reply as the assistant message a
   // client echoes back -- its content, tool calls and reasoning, as sent -- so
   // the next request's tail begins at whatever follows it.
-  held = cr.msgs;
+  conv->held = cr.msgs;
   Message reply;
   reply.role = "assistant";
   reply.content = content;
   reply.reasoning = reasoning;
   reply.tool_calls = calls;
-  held.push_back(std::move(reply));
-  held_system = cr.system;
-  held_tools = cr.tools;
+  conv->held.push_back(std::move(reply));
+  conv->held_system = cr.system;
+  conv->held_tools = cr.tools;
   // A reply cut at a stop sequence leaves the session holding tokens the client
   // never saw, so the next request cannot simply append to it.
-  held_ok = !stops.hit();
+  conv->held_ok = !stops.hit();
 
   if (cr.stream) {
     ok = send_finish(fd, id, created, opt.model_name, finish);
@@ -1322,9 +1392,15 @@ bool Server::handle(const ChatRequest& cr, int fd) {
     snprintf(pics, sizeof(pics), " [%d picture%s, %.1fs vision]", st.images,
              st.images == 1 ? "" : "s", st.vision_t);
   }
-  fprintf(stderr, "  %s %d in (%zu cached) + %d out in %.1fs (prefill %.1fs %.0f tok/s,"
+  char slot[96];
+  int len = snprintf(slot, sizeof(slot), "[%zu/%zu]", slot_of(conv) + 1, convs.size());
+  if (evicted) {
+    snprintf(slot + len, sizeof(slot) - len, " (displaced a %zu-token conversation)", evicted);
+  }
+  fprintf(stderr, "  %s %s %d in (%zu cached) + %d out in %.1fs (prefill %.1fs %.0f tok/s,"
                   " decode %.1fs %.1f tok/s)%s%s%s\n",
-          append ? "continued" : "prefilled", st.prompt_n, reused, st.n, dt, st.prefill_t,
+          slot, append ? "continued" : "prefilled", st.prompt_n, reused, st.n, dt,
+          st.prefill_t,
           st.prompt_n / (st.prefill_t > 0 ? st.prefill_t : 1e-9), decode_t,
           st.n / decode_t, pics, cr.think ? " [think]" : "",
           stops.hit() ? " [stop sequence]"
@@ -1332,6 +1408,8 @@ bool Server::handle(const ChatRequest& cr, int fd) {
 
   if (cr.dump_no) {
     std::string out = "{\"continued\":" + std::string(append ? "true" : "false") +
+                      ",\"slot\":" + std::to_string(slot_of(conv) + 1) +
+                      ",\"displaced_tokens\":" + std::to_string(evicted) +
                       ",\"prompt\":" + dump_breakdown(cr, from, reused) +
                       ",\"usage\":" + usage_json(st.prompt_n, st.n, reused) +
                       ",\"finish_reason\":" + quoted(finish) + ",\"timings\":{\"prefill_s\":" +

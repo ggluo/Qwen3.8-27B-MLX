@@ -152,6 +152,7 @@ struct Args {
   std::string api_key;
   std::string model_name;  // defaults to the model directory's own name
   std::string dump_dir;    // non-empty => write every request and reply there
+  int slots = 4;           // conversations held at once
 };
 
 Args parse_args(int argc, char** argv) {
@@ -183,12 +184,13 @@ Args parse_args(int argc, char** argv) {
     else if (f == "--api-key") a.api_key = next();
     else if (f == "--model-name") a.model_name = next();
     else if (f == "--dump") a.dump_dir = next();
+    else if (f == "--slots") a.slots = atoi(next().c_str());
     else if (f == "-h" || f == "--help") {
       printf("usage: ai [--model DIR] [--system TEXT] [--think] [--temp F]\n"
              "          [--top-p F] [--top-k N] [-k N] [--no-spec] [-n N]\n"
              "          [--prompt TEXT] [--image PATH]... [--max-pixels N]\n"
              "       ai --serve [--host IP] [--port N] [--api-key KEY]\n"
-             "          [--model-name NAME] [--dump DIR] [--max-pixels N]\n\n"
+             "          [--model-name NAME] [--dump DIR] [--max-pixels N] [--slots N]\n\n"
              "  --image attaches a picture to the first message (repeatable).\n"
              "  --max-pixels downscales pictures above N pixels; every 32x32 is one\n"
              "  token, and the default %lld caps a picture at %lld tokens.\n%s",
@@ -362,6 +364,7 @@ int main(int argc, char** argv) {
     opt.draft = a.draft;
     opt.dump_dir = a.dump_dir;
     opt.max_pixels = a.max_pixels;
+    opt.slots = a.slots;
     serve(path, opt);
     return 0;  // unreachable: serve() exits
   }
