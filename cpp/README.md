@@ -232,8 +232,79 @@ conversation. `--max-pixels` sets the size cap, as in the REPL.
 
 Also `--host` (default `127.0.0.1`: this is a local model, and the default keeps
 it local), `--api-key` (requires `Authorization: Bearer <key>`; `/health` stays
-open), plus the same `--system`, `--think`, `-k`, `--no-spec` and `-n` knobs the
-REPL takes, as defaults for requests that do not ask.
+open), `--slots N` (conversations held at once, below), plus the same
+`--system`, `--think`, `-k`, `--no-spec` and `-n` knobs the REPL takes, as
+defaults for requests that do not ask.
+
+### How a request finds its conversation
+
+For each request the server looks through its held conversations for one the
+request extends. If it finds one, it **continues**: only the new messages are
+prefilled. If not, it **prefills** the whole request into a slot, and if every
+slot is taken, that slot's old conversation is discarded. The code is
+`Server::find` and `Server::claim` in `src/serve.cpp`.
+
+**Step 1: does the request extend a held conversation?** A held conversation
+counts as extended only if all of these hold:
+
+1. **It can still be continued** (`held_ok`): its last reply completed. See
+   below for what breaks this.
+2. **Same head.** The request's system prompt and tool list are identical to the
+   ones the conversation was built with. Any change, even reordered tools, means
+   no match.
+3. **The request is longer.** It has more messages than the conversation holds.
+   So a client that retries the identical request does not match; it gets a
+   fresh prefill in another slot.
+4. **Every held message matches** the request's message at the same position
+   (`same_message`):
+   - role and content: identical;
+   - pictures: compared by the bytes the client sent, so the same words about a
+     different picture do not match;
+   - tool calls: same names and arguments;
+   - reasoning: ignored, because clients often drop it when they echo a reply.
+     The context keeps it either way.
+
+The held messages include the server's own **last reply**, recorded exactly as
+it was sent to the client: content and tool calls. So the client must echo that
+reply unchanged. If several conversations match, the server picks the one
+holding the most messages.
+
+**Step 2: continue or prefill.**
+
+- **Match → continue.** The server renders only the messages after the held
+  ones (`render_tail`), prefills those, and generates. The log says
+  `[slot/N] continued X in (Y cached)`.
+- **No match → prefill.** The server renders the whole conversation, system
+  prompt and tools included (`render_chat`), into a slot chosen in this order:
+  1. a new slot, while fewer than `--slots` (default 4) are in use;
+  2. otherwise one whose conversation can never be continued (`held_ok` false);
+  3. otherwise the least recently used.
+
+  That slot's cache is discarded and the new conversation is prefilled from
+  zero. The log says `prefilled X in (0 cached)`, plus
+  `(displaced a N-token conversation)` when it evicted one.
+
+A request refused with a `400` (a bad picture, say) is turned away before any
+of this, so every held conversation is exactly as it was.
+
+**What makes a conversation impossible to continue.** The server sets
+`held_ok = false` when generation starts, and back to true only when the reply
+completes. It stays false if:
+
+- the client disconnected mid-reply;
+- generation failed with an error;
+- a stop sequence cut the reply. The cache then holds tokens the client never
+  saw, so no echo can match.
+
+A reply that ran into `max_tokens` is complete in this sense: the client
+received exactly what the cache holds, and echoing it continues normally.
+
+**Why it is all or nothing.** There is no partial match, where the server keeps
+the first part of a conversation and recomputes from the first difference. A
+pure-attention model could do that by truncating its KV cache. Here the 48
+DeltaNet layers' state has already absorbed every token and cannot be wound back
+to an earlier point. So a history that differs anywhere (edited, summarized,
+with a message dropped) is prefilled from scratch.
 
 ### Seeing what a client actually sends
 
@@ -245,7 +316,7 @@ arrival order — the same order as the log lines:
 | `NNNN-request.json` | the request body, verbatim |
 | `NNNN-prompt.txt` | the exact text handed to the model, when the request was rendered from scratch: the whole conversation, system prompt and tool schemas included |
 | `NNNN-prompt-tail.txt` | the same, when the request only extended a conversation the session was already holding. That prompt really is only the new turns — everything before it is already in the KV cache — and the file is named so that half a conversation cannot be mistaken for a whole prompt |
-| `NNNN-response.json` | the reply — content, reasoning, tool calls — with its timings, and `prompt`: what this request's prompt was made of |
+| `NNNN-response.json` | the reply — content, reasoning, tool calls — with its timings, `slot` (which held conversation it used) and `displaced_tokens` (the conversation it pushed out, if any), and `prompt`: what this request's prompt was made of |
 
 `prompt` in the response is what the breakdown has to be read as:
 
@@ -278,29 +349,27 @@ see why a client is unhappy.
 This is the one thing in this binary that writes a conversation to disk, and it
 only happens when asked. The directory is created mode 0700.
 
-Four things worth knowing:
+Six things worth knowing:
 
 * **The KV cache is reused across requests.** A request whose `messages` extend
-  the conversation the server is already holding appends only the new turns;
-  anything else resets and re-prefills. A client that echoes its history back
-  pays for that history once, not on every turn. The log line says which
-  happened: `continued` or `prefilled`.
+  a conversation the server is already holding appends only the new turns;
+  anything else starts a new conversation. A client that echoes its history back
+  pays for that history once, not on every turn. How a request is matched is
+  [above](#how-a-request-finds-its-conversation); the log line says which
+  happened, `continued` or `prefilled`, and in which slot, `[2/4]`.
 
-  The held conversation includes the **last reply**, recorded as the assistant
-  message the client gets back — content and tool calls, as sent. The context
-  already holds that reply as the model wrote it, so a request that echoes it
-  unchanged feeds only what follows; one that echoes it altered (or leaves it
-  out) is a different conversation and starts over. A reply that ended early —
-  the client hung up, Ctrl-C, a stop string — leaves the context holding tokens
-  the next request cannot account for, so that one starts over too.
-
-  It is all or nothing because of the 48 linear-attention layers: their state
-  is overwritten by every token and cannot be rewound, so there is no reusing
-  the shared part of an edited history the way a pure-attention server can by
-  truncating its KV cache.
-* **One generation at a time.** There is one conversation and one set of caches,
-  so a second request queues behind the first — while `/health` and `/v1/models`
-  are still answered immediately.
+  The server holds several conversations, `--slots N` of them (default 4), each
+  with its own caches. This is for agent clients. Between turns they ask the same
+  model for a session title, or a recap of the turn, each with a system prompt
+  of its own. With one conversation held, each of those reset it, and the
+  agent's next turn re-prefilled its whole history: on a replayed OpenChamber
+  session, the second message took 33 s of prefill instead of 0.3 s, and two
+  minutes at 20K tokens. A slot costs its conversation's KV cache — 64 KB a
+  token on the 27B, 32 KB on the 9B — plus a fixed 151 MB (50 MB) of DeltaNet
+  state.
+* **One generation at a time.** The conversations share one model and one
+  thread, so a second request queues behind the first — while `/health` and
+  `/v1/models` are still answered immediately.
 * **One thread owns the model.** MLX ties every array to the stream of the
   thread that created it, so the weights are loaded by, and only ever touched
   by, a single thread; connection threads hand it one request at a time. Loading
